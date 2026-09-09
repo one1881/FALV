@@ -1,0 +1,42 @@
+# ===== 敏感配置（严禁入库）=====
+.env
+backend/.env
+*.env.local
+
+# ===== 隐私数据 / 测试素材 =====
+证据/
+数据/
+backend/uploads/
+yolo-video-service/outputs/
+backend/app/legal_ai.db
+*.db
+model_compare/
+
+# ===== 个人材料 =====
+项目话术_*
+*逐字稿*
+MEMORY.md
+.workbuddy/
+
+# ===== 依赖与构建产物 =====
+node_modules/
+frontend/dist/
+frontend/dist-verify/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ===== 模型权重与大文件 =====
+backend/models/
+yolo-video-service/*.mp4
+*.bin
+*.safetensors
+
+# ===== 运行时产物 =====
+*.log
+backend/eval_output/
+backend/runtime/
+backend/large_tool_results/
+.DS_Store
+Thumbs.db
