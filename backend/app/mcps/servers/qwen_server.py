@@ -87,11 +87,26 @@ class QwenServer(BaseMCPServer):
             return {"provider": "qwen", "mode": "fallback", "recommendation": "可预受理，需补充材料", "risk_level": "中", "missing_materials": ["Qwen 评估失败，请人工复核"], "next_steps": ["人工复核证据", "补齐材料"], "reasoning": str(exc)}
 
     def _build_extract_prompt(self, material_type: str, content: str, parser_result: Dict[str, Any]) -> str:
+        audio_rule = ""
+        if material_type == "audio":
+            audio_rule = (
+                "音频材料补充约定：解析结构中若含 asr_segments（带时间戳与说话人编号的分段转写），"
+                "请基于各说话人的言语内容推断其角色身份（如\"疑似债权人\"\"疑似客服\"\"疑似办案人员\"\"身份不明\"），"
+                "在输出中增加 speaker_roles 字段：[{\"speaker\": \"说话人1\", \"role\": \"疑似…\", \"依据\": \"对应的关键话语摘要\"}]。"
+                "角色判断是 AI 推断，仅供律师参考，每个 role 前必须带\"疑似\"字样；"
+                "若有多个说话人，summary 中可指明关键承诺/事实出自哪个说话人及其说话时间点。"
+                "另必须输出 key_moments 字段（重要内容筛选）：从 asr_segments 中只挑出**能对案件定性**的片段"
+                "（承诺/承认/否认、金额、日期期限、威胁恐吓、催告、身份信息、关键抗辩等），"
+                "寒暄、语气词、无信息量的过场对话一律丢弃，宁缺毋滥；"
+                "每条格式 {\"time\": \"mm:ss\", \"speaker\": \"说话人N\", \"text\": \"原话摘录\", \"why\": \"一句话说明为什么关键\"}，"
+                "time 使用该片段自带的时间戳；没有关键片段时输出空数组，禁止编造不存在的语句。"
+            )
         return "\n".join([
             "请分析以下证据材料，输出严格 JSON，字段包括：document_type、summary、key_info、proof_purpose、risk_notes、need_confirm、useful、evidence_level。",
             "字段约定：useful 为布尔值，表示该证据对己方是否有利（true=有利，false=不利）；evidence_level 取值仅限 A/B/C（A=证明力强，B=证明力中等，C=证明力弱或需补证）。",
             "key_info 约定（重要）：必须输出非空对象，结构为 {\"人物\": [\"提及的人名/称呼\"], \"机构/地点\": [\"出现的机构、场所、地点\"], \"金额\": [\"提及的金额\"], \"日期时间\": [\"提及的日期/时间\"], \"关键事实/承诺\": [\"关键事实、承诺或约定\"]}。各列表按材料实际内容填写，没有的留空数组，但至少一个列表非空。",
             "summary 约定（重要）：用一句话凝练概括该材料证明的核心事实，30~90 个汉字，律师可直接引用。风格参照：'该收据证明曾小伟于2023年11月15日至17日入住汉庭酒店人民广场店402房并已结清'、'该聊天记录显示被告承诺于2026年4月底归还借款10万元'。禁止使用 markdown 标题（###）、禁止分点（-）、禁止写'人物与物体'这类栏目式清单，详细的人物/物体/动作/时间清单全部放进 key_info。",
+            audio_rule,
             f"材料类型：{material_type}",
             f"解析文本：{content[:6000]}",
             "解析结构：" + json.dumps(parser_result, ensure_ascii=False)[:6000],

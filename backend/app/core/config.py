@@ -17,9 +17,20 @@ class Settings(BaseSettings):
     QWEN_API_URL: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     # 起草/审核专用模型（留空则回落到 QWEN_MODEL）
     DRAFT_REVIEW_MODEL: str = ""
+    ROOT_AGENT_MODEL: str = ""  # 主控根代理专用模型；留空回落 DRAFT_REVIEW_MODEL
     # A2A 多智能体（起草 :8001 / 审核 :8002 独立子代理服务）
     A2A_ENABLED: bool = True
     A2A_TOKEN: str = ""          # 留空=不鉴权（本机开发）；设置后 message/send 须带同值 X-A2A-Token
+    # A2A 等待上限按业务区分：起草目标 5 分钟，审核允许更长。
+    A2A_TIMEOUT_SECONDS: float = 600.0
+    A2A_DRAFTING_TIMEOUT_SECONDS: float = 300.0
+    # 模型单次请求上限按业务区分：起草 180 秒，审核保留 600 秒。
+    DRAFTING_MODEL_TIMEOUT_SECONDS: float = 180.0
+    REVIEW_MODEL_TIMEOUT_SECONDS: float = 600.0
+    ROOT_MODEL_TIMEOUT_SECONDS: float = 180.0
+    # False=httpx 忽略 HTTP_PROXY 环境变量：本机代理无 no_proxy，
+    # 会把 127.0.0.1 的回环 A2A 调用也绕去代理中转，纯属浪费。
+    A2A_TRUST_ENV: bool = False
     DRAFTING_AGENT_PORT: int = 8001
     REVIEW_AGENT_PORT: int = 8002
     DEEPSEEK_API_KEY: str = ""
@@ -56,6 +67,11 @@ class Settings(BaseSettings):
     def draft_review_llm_model(self) -> str:
         """文书起草/审核专用模型；未配置时回落主模型。"""
         return self.DRAFT_REVIEW_MODEL or self.primary_llm_model
+
+    @property
+    def root_agent_llm_model(self) -> str:
+        """主控根代理模型；未配置时回落起草/审核模型（默认同一模型）。"""
+        return self.ROOT_AGENT_MODEL or self.draft_review_llm_model
 
     VIDEO_UNDERSTAND_MAX_FRAMES: int = 6
     VIDEO_UNDERSTAND_FRAME_INTERVAL: int = 3

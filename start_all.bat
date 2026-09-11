@@ -9,6 +9,17 @@ REM ============================================================
 chcp 65001 >nul
 cd /d "%~dp0"
 
+REM 清除沙箱/工具进程注入的代理变量。
+REM 若 HTTP_PROXY=127.0.0.1:8279 被继承，模型请求会被绕进本地代理挂死（实测卡满 50 分钟）。
+set "HTTP_PROXY="
+set "HTTPS_PROXY="
+set "http_proxy="
+set "https_proxy="
+set "ALL_PROXY="
+set "all_proxy="
+set "NO_PROXY="
+set "no_proxy="
+
 echo [1/2] 启动后端 :8000 （YOLO :9001 与 A2A 子代理 :8001/:8002 会随后端自动拉起）...
 start "legal-backend-8000" cmd /c "cd backend && D:\an\python.exe -m uvicorn app.main:app --host 0.0.0.0 --port 8000"
 

@@ -1,6 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router";
 
+/** 松散抽取 JSON 文本里指定字符串字段（容忍裸换行等非法 JSON），找不到返回空串 */
+function extractJsonStringFieldLoose(text: string, field: string): string {
+  const m = text.match(new RegExp(`"${field}"\\s*:\\s*"`));
+  if (!m || m.index === undefined) return "";
+  let i = m.index + m[0].length;
+  let out = "";
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '"') break; // 未转义收尾引号（\" 已被转义分支整体消费）
+    if (ch === "\\" && i + 1 < text.length) {
+      const nxt = text[i + 1];
+      out += nxt === "n" ? "\n" : nxt === "r" ? "\r" : nxt === "t" ? "\t" : nxt;
+      i += 2;
+      continue;
+    }
+    out += ch === "\n" || ch === "\r" ? "\n" : ch;
+    i += 1;
+  }
+  return out;
+}
+
 /**
  * 兜底解包：历史合同可能把 {"content": {...}} 整体序列化存成了正文，
  * 导致编辑器渲染出一坨原始 JSON。这里循环解出内层纯文本。
@@ -25,7 +46,14 @@ function unwrapJsonContent(raw: string): string {
       break;
     }
   } catch {
-    /* 不是合法 JSON，按原文返回 */
+    /* 不是合法 JSON，走下面的松散抽取 */
+  }
+  // 合法解析失败但形如信封（模型输出带裸换行等）：松散抽 content 字段
+  if (s.includes('"content"')) {
+    const extracted = extractJsonStringFieldLoose(s, "content");
+    if (extracted.trim().length > 80) {
+      return extracted.replace(/\n/g, "<br>");
+    }
   }
   return raw;
 }

@@ -1,5 +1,7 @@
 from typing import Optional
 
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
@@ -133,6 +135,67 @@ async def review_document(context: dict, current_user: User = Depends(get_curren
         document_type=context.get("document_type"),
     )
     return result
+
+
+@router.post("/review-document-async")
+async def review_document_async(context: dict, current_user: User = Depends(get_current_user)):
+    """异步提交审核任务：立即返回 task_key，前端轮询进度。
+
+    审核是分钟级 agent 循环，同步等待容易被浏览器/代理掐断报"请求超时"，
+    改为提交后轮询，前端还能展示实时进度。
+    """
+    if not (context.get("content") or "").strip():
+        raise HTTPException(status_code=422, detail="缺少合同正文内容")
+    service = get_deepagents_service()
+    task_key = f"review:review_document:{current_user.id}:{uuid.uuid4().hex[:8]}"
+    request = AgentExecuteRequest(task_type="review", action="review_document", context=context).model_dump()
+    snapshot = service.start_execute(task_key, request)
+    return {
+        "task_key": task_key,
+        "status": snapshot.get("status", "running"),
+        "poll_url": f"/api/review/tasks/{task_key}",
+    }
+
+
+@router.get("/tasks/{task_key}")
+async def get_review_task(
+    task_key: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """轮询审核任务快照：status=completed 时返回完整结构化结果（含已落库的记录 id）。"""
+    service = get_deepagents_service()
+    task = service.get_task(task_key)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期（服务可能重启过）")
+    # 属主校验：task_key 形如 review:review_document:{user_id}:{rand}
+    parts = task_key.split(":")
+    if len(parts) >= 3 and str(current_user.id) != parts[2]:
+        raise HTTPException(status_code=403, detail="无权查看该任务")
+
+    # 完成后幂等落一条审核记录（与同步链路行为一致）
+    if task.get("status") == "completed" and not task.get("record_created"):
+        result = task.get("result")
+        if isinstance(result, dict) and result:
+            ctx = task.get("context") or {}
+            record = ReviewService(db).create_review_record(
+                reviewer_id=current_user.id,
+                result=result,
+                contract_id=ctx.get("contract_id"),
+                document_type=ctx.get("document_type"),
+            )
+            task_obj = service._tasks.get(task_key)
+            if task_obj is not None:
+                task_obj.record_created = True
+                task_obj.review_record_id = getattr(record, "id", None)
+            task = service.get_task(task_key) or task
+
+    # 轮询响应瘦身：合同全文不再随每次轮询回传
+    slim = dict(task)
+    ctx = slim.get("context") or {}
+    if isinstance(ctx, dict) and "content" in ctx:
+        slim["context"] = {k: v for k, v in ctx.items() if k != "content"}
+    return slim
 
 
 @router.get("/records")

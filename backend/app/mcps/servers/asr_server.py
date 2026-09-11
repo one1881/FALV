@@ -76,7 +76,7 @@ class ASRServer(BaseMCPServer):
                 task_resp = await client.post(
                     f"{base}/services/audio/asr/transcription",
                     headers={**auth, "Content-Type": "application/json", "X-DashScope-Async": "enable", "X-DashScope-OssResourceResolve": "enable"},
-                    json={"model": "paraformer-v2", "input": {"file_urls": [oss_url]}, "parameters": {"language_hints": ["zh"]}},
+                    json={"model": "paraformer-v2", "input": {"file_urls": [oss_url]}, "parameters": {"language_hints": ["zh"], "diarization_enabled": True}},
                 )
                 task_resp.raise_for_status()
                 task_id = task_resp.json()["output"]["task_id"]
@@ -109,7 +109,15 @@ class ASRServer(BaseMCPServer):
             return path
         return tmp if tmp.exists() and tmp.stat().st_size > 0 else path
 
-    async def _fetch_transcript(self, client: httpx.AsyncClient, output: Dict[str, Any]) -> str:
+    async def _fetch_transcript(self, client: httpx.AsyncClient, output: Dict[str, Any]) -> Dict[str, Any]:
+        """拉取转写结果，收集句子级时间戳与说话人编号。
+
+        DashScope 返回 transcripts[].sentences[]，每句含 begin_time/end_time（毫秒）、
+        text，diarization_enabled 开启后每句还带 speaker_id。旧代码只取 text 丢弃
+        时间戳，导致转写永远是一坨无时间标注的纯文本——现在全部保留。
+        """
+        full_text_parts: list = []
+        raw_sentences: list = []
         for item in output.get("results") or []:
             tu = item.get("transcription_url") or (item.get("output") or {}).get("transcription_url")
             if not tu:
@@ -117,19 +125,65 @@ class ASRServer(BaseMCPServer):
             resp = await client.get(tu)
             resp.raise_for_status()
             data = resp.json()
-            texts = [t.get("text", "") for t in data.get("transcripts", [])]
-            return "".join(texts)
-        return ""
+            for t in data.get("transcripts", []):
+                full_text_parts.append(t.get("text", ""))
+                for s in t.get("sentences") or []:
+                    text = (s.get("text") or "").strip()
+                    if not text:
+                        continue
+                    raw_sentences.append({
+                        "begin_ms": s.get("begin_time"),
+                        "end_ms": s.get("end_time"),
+                        "speaker_id": s.get("speaker_id"),
+                        "text": text,
+                    })
+        return {"text": "".join(full_text_parts), "sentences": raw_sentences}
 
-    def _normalize(self, transcript: str, duration_seconds: float, chunk_seconds: int, chunk_count: int) -> Dict[str, Any]:
+    @staticmethod
+    def _ms_to_ts(ms: Any) -> str:
+        """毫秒 → mm:ss（超 1 小时转 h:mm:ss）。缺失返回 '?'。"""
+        try:
+            total = int(ms) // 1000
+        except (TypeError, ValueError):
+            return "?"
+        h, rem = divmod(total, 3600)
+        m, sec = divmod(rem, 60)
+        return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+    @classmethod
+    def _merge_turns(cls, sentences: list, max_turns: int = 200) -> list:
+        """句子 → 说话人轮次：连续同一说话人的句子合并成一段，避免逐句碎片化。"""
+        turns: list = []
+        for s in sentences:
+            spk = f"说话人{(s.get('speaker_id') or 0) + 1}" if s.get("speaker_id") is not None else "说话人待识别"
+            if turns and turns[-1]["speaker"] == spk:
+                turns[-1]["_end_ms"] = s.get("end_ms")
+                turns[-1]["text"] += s["text"]
+            else:
+                turns.append({
+                    "_start_ms": s.get("begin_ms"),
+                    "_end_ms": s.get("end_ms"),
+                    "speaker": spk,
+                    "text": s["text"],
+                })
+            if len(turns) >= max_turns:
+                break
+        for t in turns:
+            t["start"] = cls._ms_to_ts(t.pop("_start_ms"))
+            t["end"] = cls._ms_to_ts(t.pop("_end_ms"))
+        return turns
+
+    def _normalize(self, transcript: Dict[str, Any], duration_seconds: float, chunk_seconds: int, chunk_count: int) -> Dict[str, Any]:
+        text = (transcript or {}).get("text") or ""
+        segments = self._merge_turns((transcript or {}).get("sentences") or [])
         return {
             "provider": "dashscope_paraformer",
             "mode": "api",
             "duration_seconds": duration_seconds,
             "chunk_seconds": chunk_seconds,
             "chunk_count": chunk_count,
-            "transcript": transcript,
-            "segments": [],
+            "transcript": text,
+            "segments": segments,
             "key_info": {"待确认字段": "说话人、金额、日期、付款承诺、催告内容、对方抗辩"},
             "confidence": 0.9,
         }

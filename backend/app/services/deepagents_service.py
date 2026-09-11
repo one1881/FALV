@@ -12,8 +12,10 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -32,6 +34,7 @@ from app.core.config import get_settings
 from app.services.agent_core import (
     AgentCore,
     build_chat_model,
+    build_root_chat_model,
     list_skill_documents,
     list_mcp_servers,
     list_mcp_tools,
@@ -53,6 +56,9 @@ class DeepAgentTask:
     events: List[Dict[str, Any]] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    record_created: bool = False  # 审核记录是否已落库（异步任务完成后幂等落一次）
+    review_record_id: Optional[int] = None
+    timings: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -61,6 +67,7 @@ class DeepAgentTask:
 class DeepAgentsService(AgentCore):
     def __init__(self):
         self._tasks: Dict[str, DeepAgentTask] = {}
+        self._background_tasks: set = set()  # 后台异步任务引用（防 GC）
         from app.core.checkpoint import build_checkpointer
         self._checkpointer = build_checkpointer()
         # A2A 派发所需：thread_id -> 当前请求 / 子代理产物
@@ -74,7 +81,7 @@ class DeepAgentsService(AgentCore):
     # ------------------------------------------------------------------
     def _build_agent(self):
         return create_deep_agent(
-            model=build_chat_model(),
+            model=build_root_chat_model(),
             tools=self._build_root_tools(),
             system_prompt=(
                 "你是法律合同系统的主代理（A2A 主控），负责协调起草、审核和诉讼三个业务模块。"
@@ -82,7 +89,10 @@ class DeepAgentsService(AgentCore):
                 "起草任务调用 dispatch_drafting_task 派发，审核任务调用 dispatch_review_task 派发。"
                 "派发工具返回的 JSON 就是子代理的结构化交付物，必须原样、完整地作为最终回复输出，"
                 "不得改写、增删或省略字段，不要附加任何解释。"
-                "诉讼任务由你本体执行。优先使用技能、MCP 工具和文件上下文，输出要结构化、可回传。"
+                "【起草/审核任务的执行纪律】这两个子代理已各自预加载专属技能说明，"
+                "你只需直接调用对应派发工具，不要读取、列举或探索任何 skill 文件"
+                "（不要用 ls / list_skill_documents / read_file 去看 /skills），以免浪费工具轮。"
+                "诉讼任务由你本体执行，此时可按需读取技能、MCP 工具和文件上下文，输出要结构化、可回传。"
             ),
             skills=self.build_skill_documents(),
             memory=self.build_memory_paths(),
@@ -149,10 +159,23 @@ class DeepAgentsService(AgentCore):
                 "action": request.get("action", ""),
                 "context": request.get("context", {}) or {},
             }
+            started_at = time.perf_counter()
             # 1) A2A 标准链路：Agent Card 发现 → message/send → artifact
             try:
-                result = await service._a2a_client.call_agent(agent_url, payload)
+                result = await service._a2a_client.call_agent(
+                    agent_url,
+                    payload,
+                    timeout_seconds=(
+                        settings.A2A_DRAFTING_TIMEOUT_SECONDS
+                        if kind == "drafting"
+                        else settings.A2A_TIMEOUT_SECONDS
+                    ),
+                )
                 transport = "a2a"
+                elapsed = time.perf_counter() - started_at
+                task = service._tasks.get(thread_id)
+                if task is not None:
+                    task.timings["a2a"] = round(elapsed, 3)
             except A2AAgentExecutionError as exc:
                 # 子代理已真实执行并失败（多为模型/上游错误，如 Arrearage）——
                 # 进程内重跑大概率同样失败，直接抛出，避免双倍耗时/费用
@@ -188,6 +211,22 @@ class DeepAgentsService(AgentCore):
     # ------------------------------------------------------------------
     # 任务执行
     # ------------------------------------------------------------------
+    def start_execute(self, task_key: str, request: Dict[str, Any]) -> Dict[str, Any]:
+        """异步启动任务：后台跑 execute，立即返回任务快照供前端轮询。
+
+        审核等分钟级长任务如果让 HTTP 请求同步等到底，链路上任何一环
+        （浏览器/开发代理/网关）都可能掐断连接报"请求超时"；改为提交后
+        轮询，前端还能拿 events 展示进度。幂等：同 key 已在跑则直接返回快照。
+        """
+        existing = self._tasks.get(task_key)
+        if existing is not None and existing.status == "running":
+            return existing.to_dict()
+        bg = asyncio.get_running_loop().create_task(self.execute(task_key, request))
+        self._background_tasks.add(bg)
+        bg.add_done_callback(self._background_tasks.discard)
+        task = self._tasks.get(task_key)
+        return task.to_dict() if task else {"task_id": task_key, "status": "running"}
+
     async def execute(self, task_key: str, request: Dict[str, Any]) -> Dict[str, Any]:
         task = self._tasks.get(task_key)
         if task is None:
@@ -215,12 +254,15 @@ class DeepAgentsService(AgentCore):
         self._active_requests[task_key] = request
         self._a2a_results.pop(task_key, None)
 
+        orchestrator_start = time.perf_counter()
         try:
             prompt = self._build_prompt(request, as_root=True)
             raw_result = await self._agent.ainvoke(
                 {"messages": [{"role": "user", "content": prompt}]},
                 config={"configurable": {"thread_id": task_key}},
             )
+            orchestrator_elapsed = time.perf_counter() - orchestrator_start
+            task.timings["orchestrator"] = round(orchestrator_elapsed, 3)
             # 子代理产物优先：A2A 工具实际返回的结构化结果不经 LLM 转手，
             # 直接作为 task.result（root 回复仅作为对话记录）。
             a2a_payload = self._a2a_results.pop(task_key, None)
@@ -247,6 +289,11 @@ class DeepAgentsService(AgentCore):
                 structured = self._build_structured_result(request, normalized)
             task.status = "completed"
             task.result = structured
+            task.timings["total"] = round(time.perf_counter() - orchestrator_start, 3)
+            logger.info(
+                "[deepagents] 任务完成 task=%s type=%s timings=%s",
+                task_key, request.get("task_type"), task.timings
+            )
             # 长期记忆回写：任务结束后检测运行期记忆文件是否被 Agent 修改（轻量版 PG 同步）
             try:
                 from app.services.agent_memory_service import sync_runtime_memory

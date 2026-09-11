@@ -36,9 +36,12 @@ class A2AAgentExecutionError(A2AError):
 
 
 class A2AClient:
-    def __init__(self, timeout_seconds: float = 900.0):
-        # 起草/审核是 LLM 多轮任务，耗时可达数分钟，超时必须放宽
-        self._default_timeout = timeout_seconds
+    def __init__(self, timeout_seconds: Optional[float] = None, trust_env: Optional[bool] = None):
+        # 起草/审核是 LLM 多轮任务，耗时可达数分钟；审核 agent 循环实测 8-15 分钟，
+        # 原先硬编码 900s 会踩线超时 → 触发进程内回退重跑（双倍耗时与费用）。
+        self._default_timeout = timeout_seconds or settings.A2A_TIMEOUT_SECONDS
+        # trust_env=False：忽略 HTTP_PROXY/HTTPS_PROXY，避免本机回环请求绕经本地代理
+        self._trust_env = settings.A2A_TRUST_ENV if trust_env is None else trust_env
         self._card_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
     def _auth_headers(self) -> Dict[str, str]:
@@ -52,7 +55,7 @@ class A2AClient:
         if cached and not force and (time.time() - cached[0]) < CARD_CACHE_TTL_SECONDS:
             return cached[1]
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=15.0, trust_env=self._trust_env) as client:
                 resp = await client.get(f"{url}/.well-known/agent-card.json")
                 resp.raise_for_status()
                 card = resp.json()
@@ -80,7 +83,7 @@ class A2AClient:
         }
         timeout = httpx.Timeout(timeout_seconds or self._default_timeout, connect=10.0)
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=self._trust_env) as client:
                 resp = await client.post(f"{url}/", json=payload, headers=self._auth_headers())
         except Exception as exc:
             raise A2AError(f"A2A message/send 网络失败 ({url}): {exc}") from exc
@@ -106,11 +109,20 @@ class A2AClient:
             raise A2AError(f"A2A 响应缺少 result task: {str(body)[:300]}")
         return task
 
-    async def call_agent(self, base_url: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    async def call_agent(
+        self,
+        base_url: str,
+        payload: Dict[str, Any],
+        timeout_seconds: Optional[float] = None,
+    ) -> Dict[str, Any]:
         """一步到位：发现（TTL 缓存）→ 派发 → 解析 artifact JSON，返回 agent 的结构化结果。"""
         card = await self.fetch_agent_card(base_url)
         agent_name = card.get("name", "?")
-        task = await self.send_message(base_url, json.dumps(payload, ensure_ascii=False, default=str))
+        task = await self.send_message(
+            base_url,
+            json.dumps(payload, ensure_ascii=False, default=str),
+            timeout_seconds=timeout_seconds,
+        )
         state = (task.get("status") or {}).get("state")
         if state != "completed":
             err = task.get("error") or {}
@@ -142,7 +154,7 @@ class A2AClient:
         """同步探活（启动日志用）。"""
         import httpx as _httpx
         try:
-            resp = _httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0)
+            resp = _httpx.get(f"{base_url.rstrip('/')}/health", timeout=5.0, trust_env=False)
             return resp.status_code == 200
         except Exception:
             return False

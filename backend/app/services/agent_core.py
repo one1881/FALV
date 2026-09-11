@@ -13,10 +13,12 @@
 from __future__ import annotations
 
 import html
+import httpx
 import json
+import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from deepagents import create_deep_agent
 from deepagents.backends.composite import CompositeBackend
@@ -32,6 +34,8 @@ from app.mcps.clients import get_mcp_client
 
 
 settings = get_settings()
+
+logger = logging.getLogger(__name__)
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]  # backend/
 SKILL_DIR = BACKEND_ROOT / "skills"
@@ -91,14 +95,46 @@ async def call_mcp_tool(server_name: str, tool_name: str, params_json: str = "{}
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
-def build_chat_model():
-    """起草/审核专用模型（DRAFT_REVIEW_MODEL），与诉讼文本模型(QWEN_MODEL)分离。
+# --- 代理绝缘 httpx 客户端（根因修复 2026-09-10） ---------------------------
+# 事故背景：工具/沙箱进程会注入 HTTP_PROXY=127.0.0.1:8279（sandbox-cli.exe）。
+# langchain_openai / openai SDK 默认 trust_env=True，会把发往 DashScope 的模型请求
+# 全部绕经该本地代理 → 请求挂死、ReadTimeout，实测单次起草卡满 50 分钟零产出。
+# A2A 客户端早已关掉该开关（A2A_TRUST_ENV=False），但模型客户端此前没关，
+# 于是"合同生成慢"的真正源头一直没被堵住。
+# 这里把模型客户端也强制 trust_env=False，从代码层根治——无论后端被谁拉起
+# （start_all.bat / IDE / 工具进程），都不再受环境代理污染。
+_MODEL_HTTP_TIMEOUT = httpx.Timeout(600.0, connect=20.0)
+_PROXY_IMMUNE_SYNC: "httpx.Client | None" = None
+_PROXY_IMMUNE_ASYNC: "httpx.AsyncClient | None" = None
 
+
+def _proxy_immune_clients() -> "tuple[httpx.Client, httpx.AsyncClient]":
+    """返回进程级复用的 (同步, 异步) httpx 客户端对，均 trust_env=False。"""
+    global _PROXY_IMMUNE_SYNC, _PROXY_IMMUNE_ASYNC
+    if _PROXY_IMMUNE_SYNC is None:
+        _PROXY_IMMUNE_SYNC = httpx.Client(
+            trust_env=False, timeout=_MODEL_HTTP_TIMEOUT
+        )
+    if _PROXY_IMMUNE_ASYNC is None:
+        _PROXY_IMMUNE_ASYNC = httpx.AsyncClient(
+            trust_env=False, timeout=_MODEL_HTTP_TIMEOUT
+        )
+    return _PROXY_IMMUNE_SYNC, _PROXY_IMMUNE_ASYNC
+
+
+def build_chat_model(model: "str | None" = None, timeout: float | None = None):
+    """代理用 ChatOpenAI 构造器。
+
+    - 默认读起草/审核模型（DRAFT_REVIEW_MODEL），与诉讼文本模型(QWEN_MODEL)分离
+    - 传入 model 参数可覆盖（如主控根代理用 ROOT_AGENT_MODEL）
     timeout/max_retries 必须显式收紧：代理抖动时 openai SDK 默认等 600s 且重试 2 次，
     用户端会表现为"进度条卡死十几分钟"。
+    - http_client/http_async_client 强制 trust_env=False：不读 HTTP_PROXY，
+    避免请求被绕进沙箱本地代理而挂死（根因修复 2026-09-10）。
     """
+    sync_client, async_client = _proxy_immune_clients()
     return ChatOpenAI(
-        model=settings.draft_review_llm_model,
+        model=model or settings.draft_review_llm_model,
         api_key=settings.primary_llm_api_key,
         base_url=(
             settings.primary_llm_api_url.rstrip("/")
@@ -106,8 +142,18 @@ def build_chat_model():
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ),
         temperature=0.2,
-        timeout=300,
+        timeout=timeout or settings.REVIEW_MODEL_TIMEOUT_SECONDS,
         max_retries=1,
+        http_client=sync_client,
+        http_async_client=async_client,
+    )
+
+
+def build_root_chat_model():
+    """主控根代理专用模型（ROOT_AGENT_MODEL，如 deepseek-v4-flash）；未配置回落 DRAFT_REVIEW_MODEL。"""
+    return build_chat_model(
+        settings.root_agent_llm_model,
+        timeout=settings.ROOT_MODEL_TIMEOUT_SECONDS,
     )
 
 
@@ -240,12 +286,36 @@ class AgentCore:
             logger.warning("[agent-core] 长期记忆挂载跳过: %s", exc)
         return memory_paths
 
-    def build_permissions(self) -> list[FilesystemPermission]:
-        skill_dir = SKILL_DIR
-        return [
+    def build_permissions(self, skill_files: Optional[List[str]] = None) -> list[FilesystemPermission]:
+        """构造文件系统权限规则。
+
+        2026-09-10 关键修正：deepagents 的权限判定是「首个匹配规则生效，无任何
+        规则匹配则默认放行」（middleware/filesystem.py:283 `_check_fs_permission`）。
+        原先两条 mode="allow" 规则因此**不产生任何约束力** —— 子代理 `ls /skills`
+        后能读到并 `read_file` 未分配给自己的 skill（实测起草子代理读了
+        legal-risk-check-skill，跑偏输出"合规核对结论"而非合同正文，进而触发
+        追问续跑，把任务从 3 分钟拖到 20 分钟）。
+
+        现改为：显式 deny「未分配给本代理的 skill 目录」，让 `skills=[...]` 的
+        声明式分配真正生效。`/skills` 目录本身的 ls 不被拒（不匹配 deny 规则），
+        其返回结果由 `_apply_permissions_to_ls_results` 自动过滤掉被 deny 的项。
+        传入 skill_files=None（根代理）时保持原有全量读权限不变。
+        """
+        perms: list[FilesystemPermission] = [
             FilesystemPermission(operations=["read", "write"], paths=[self._normalize_path(BACKEND_ROOT)], mode="allow"),
-            FilesystemPermission(operations=["read"], paths=[self._normalize_path(skill_dir)], mode="allow"),
         ]
+        if skill_files and SKILL_DIR.exists():
+            mine = {_skill_slug(name) for name in skill_files}
+            others = [
+                path.name for path in sorted(SKILL_DIR.iterdir())
+                if path.is_dir() and (path / "SKILL.md").exists() and path.name not in mine
+            ]
+            if others:
+                deny_paths: List[str] = []
+                for name in others:
+                    deny_paths += [f"/skills/{name}", f"/skills/{name}/**"]
+                perms.insert(0, FilesystemPermission(operations=["read"], paths=deny_paths, mode="deny"))
+        return perms
 
     def build_backend(self) -> CompositeBackend:
         return CompositeBackend(
@@ -257,13 +327,28 @@ class AgentCore:
         )
 
     def build_sub_agent(self, spec: Dict[str, Any]):
-        """按子代理规格构建独立 deep agent（A2A 服务进程内运行 / 主控回退共用）。"""
+        """按子代理规格构建独立 deep agent（A2A 服务进程内运行 / 主控回退共用）。
+
+        skill 走 deepagents 原生的 progressive disclosure：只注入 name/description/path，
+        正文由模型按需 read_file。2026-09-10 曾短暂改为"装配期预加载正文进 system_prompt"，
+        因旁路框架机制且性能收益仅约 12 秒而回退。
+
+        "分配"的约束力改由 build_permissions 保证：未分配给本代理的 skill 目录被显式
+        deny，模型即使 ls /skills 也读不到别的 skill（此前因权限敞开，起草子代理会
+        误读 legal-risk-check-skill 而跑偏）。
+        """
         return create_deep_agent(
-            model=build_chat_model(),
+            model=build_chat_model(
+                timeout=(
+                    settings.DRAFTING_MODEL_TIMEOUT_SECONDS
+                    if spec.get("name") == "drafting-agent"
+                    else settings.REVIEW_MODEL_TIMEOUT_SECONDS
+                )
+            ),
             tools=self.build_tools(),
             system_prompt=spec["system_prompt"],
             skills=self.skill_documents_for(spec["skill_files"]),
-            permissions=self.build_permissions(),
+            permissions=self.build_permissions(spec["skill_files"]),
             backend=self.build_backend(),
             checkpointer=build_checkpointer(),
             interrupt_on={"write_file": True},
@@ -331,13 +416,27 @@ class AgentCore:
 
     @staticmethod
     def _extract_final_text(messages: Any) -> str:
-        """从消息列表尾部向前找出最后一条非空的 AI 文本内容。"""
+        """从消息列表尾部向前找出最后一条非空的 AI 文本内容。
+
+        注意：必须跳过 ToolMessage/FunctionMessage 等工具消息——
+        若代理循环在工具调用后异常终止（模型报错/轮次上限），最后一条
+        消息会是工具返回值（如 {"ok": true, "data": []}），误当正文
+        会把原始 JSON 存进合同。
+        """
         if not isinstance(messages, (list, tuple)):
             return ""
         for message in reversed(list(messages)):
+            msg_type = str(getattr(message, "type", "") or "").lower()
+            role = ""
+            if isinstance(message, dict):
+                role = str(message.get("role", "") or "").lower()
+                msg_type = msg_type or role
+            # 工具消息一律跳过（LangChain 对象看 type，dict 看 role）
+            if msg_type in ("tool", "function", "tool_call", "observation"):
+                continue
             content = getattr(message, "content", None)
             if content is None and isinstance(message, dict):
-                if message.get("role") in ("user", "system"):
+                if role in ("user", "system"):
                     continue
                 content = message.get("content")
             if content is None:
@@ -387,7 +486,59 @@ class AgentCore:
                 return json.loads(cur)
             except (ValueError, TypeError):
                 continue
+        # 最后一搏：模型最常见的第三类错误——字符串值里带"裸换行/裸制表符"
+        # （真实换行字符，非法 JSON）。带字符串状态感知地转义后再试。
+        repaired = AgentCore._escape_raw_controls_in_strings(seg)
+        if repaired != seg:
+            try:
+                return json.loads(repaired)
+            except (ValueError, TypeError):
+                repaired = AgentCore._strip_bad_escapes(repaired)
+                try:
+                    return json.loads(repaired)
+                except (ValueError, TypeError):
+                    return None
         return None
+
+    @staticmethod
+    def _escape_raw_controls_in_strings(text: str) -> str:
+        r"""把 JSON 字符串字面量内部的裸控制字符（\n \r \t）转义成合法形式。
+
+        只处理处于字符串内部（in_str）的裸换行/回车/制表符；字符串之间的
+        格式化换行是合法空白，保持原样。引号翻转需跳过 \" 转义。
+        """
+        out: list[str] = []
+        i, n = 0, len(text)
+        in_str = False
+        while i < n:
+            ch = text[i]
+            if not in_str:
+                if ch == '"':
+                    in_str = True
+                out.append(ch)
+                i += 1
+                continue
+            # 字符串内部
+            if ch == "\\" and i + 1 < n:  # 转义序列原样保留（含 \"）
+                out.append(ch)
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+                out.append(ch)
+                i += 1
+                continue
+            if ch == "\n":
+                out.append("\\n")
+            elif ch == "\r":
+                out.append("\\r")
+            elif ch == "\t":
+                out.append("\\t")
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
 
     @staticmethod
     def _strip_bad_escapes(text: str) -> str:
@@ -568,6 +719,33 @@ class AgentCore:
             break
         if not isinstance(body_text, str):
             body_text = str(body_text)
+
+        # 退化内容守卫：正文若仍是 JSON 信封（如 {"ok": true, "data": []}）或过短，
+        # 说明代理没有产出真实合同（工具消息被误当正文/模型中途回落），
+        # 用兜底模板代替，绝不把原始 JSON 存进合同。
+        stripped_body = body_text.strip()
+        _degenerate = False
+        if stripped_body.startswith("{"):
+            try:
+                parsed_body = json.loads(stripped_body)
+            except (ValueError, TypeError):
+                parsed_body = None
+            if parsed_body is None:
+                # 连 JSON 都不合法（走完 _unwrap_drafting_text 仍没解出正文）
+                _degenerate = True
+            elif isinstance(parsed_body, dict) and not (
+                isinstance(parsed_body.get("content"), str) and len(parsed_body["content"].strip()) > 80
+            ):
+                _degenerate = True
+        if len(stripped_body) < 80:
+            _degenerate = True
+        if _degenerate:
+            logger.warning(
+                "[agent_core] 起草正文退化（%s...），回落兜底模板", stripped_body[:60]
+            )
+            body_text = self._fallback_contract_text(document_type, customer_name, defendant_name, case_summary, context)
+            html_text = self._to_html(body_text)
+            _title = None
 
         content = {
             "title": (raw_content.get("title") if isinstance(raw_content, dict) and raw_content.get("title")
@@ -1015,7 +1193,62 @@ class AgentCore:
         # 解析失败：剥掉可能的围栏尾巴，避免 ```json 残留在正文里
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw)
         cleaned = re.sub(r"\s*```\s*$", "", cleaned).strip()
+        # 最后的兜底：文本形如 {"content": "..."} 信封但 JSON 修不好时，
+        # 直接扫描抽取 content 字段的字符串值（带反转义），绝不把信封当正文
+        if cleaned.startswith("{") and '"content"' in cleaned:
+            extracted = self._extract_json_string_field(cleaned, "content")
+            if extracted and len(extracted.strip()) > 80:
+                body = extracted.strip()
+                title = self._extract_json_string_field(cleaned, "title") or None
+                return body, self._to_html(body), title
         return cleaned or raw, self._to_html(cleaned or raw), None
+
+    @staticmethod
+    def _extract_json_string_field(text: str, field: str) -> str:
+        """从（可能不合法的）JSON 文本里扫描抽取指定字段的字符串值并反转义。
+
+        逐字符扫描："field" :" <扫描到未转义的收尾引号>，期间处理
+        \\" \\\\ \\n \\uXXXX 等标准转义。找不到返回空串。
+        """
+        m = re.search(rf'"{re.escape(field)}"\s*:\s*"', text)
+        if not m:
+            return ""
+        out: list[str] = []
+        i, n = m.end(), len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                # 能走到这里必是未转义的收尾引号（\" 已被下面的转义分支整体消费）
+                break
+            if ch == "\\" and i + 1 < n:
+                nxt = text[i + 1]
+                if nxt == "n":
+                    out.append("\n")
+                elif nxt == "r":
+                    out.append("\r")
+                elif nxt == "t":
+                    out.append("\t")
+                elif nxt == "b":
+                    out.append("\b")
+                elif nxt == "f":
+                    out.append("\f")
+                elif nxt == "u" and i + 5 < n:
+                    try:
+                        out.append(chr(int(text[i + 2:i + 6], 16)))
+                        i += 6
+                        continue
+                    except ValueError:
+                        out.append(nxt)
+                else:  # \" \\ / 等取字面
+                    out.append(nxt)
+                i += 2
+                continue
+            if ch == "\n" or ch == "\r":
+                out.append("\n")
+            else:
+                out.append(ch)
+            i += 1
+        return "".join(out)
 
     def _fallback_contract_text(
         self,

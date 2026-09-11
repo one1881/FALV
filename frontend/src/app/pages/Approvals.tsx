@@ -10,7 +10,7 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "../../lib/utils";
-import { reviewDocument, extractDocumentText, getReviewRecords, recordToResponse, type ReviewDocumentResponse, type ReviewRecordItem } from "../../lib/api/review";
+import { startReviewDocumentAsync, getReviewTask, extractDocumentText, getReviewRecords, recordToResponse, type ReviewDocumentResponse, type ReviewRecordItem } from "../../lib/api/review";
 import { TaskProgress } from "../../app/components/TaskProgress";
 import { PageHeader } from "../components/PageHeader";
 
@@ -118,12 +118,25 @@ export function Approvals() {
     setReviewStartedAt(Date.now());
     setError("");
     try {
-      const data: ReviewDocumentResponse = await reviewDocument({
+      // 审核是分钟级 agent 循环（实测 4-8 分钟）：同步等待会被浏览器/代理
+      // 掐断报"请求超时"，改为异步提交 + 轮询进度
+      const { task_key } = await startReviewDocumentAsync({
         document_type: "contract",
         contract_id: contractId ?? undefined,
         content: content.trim(),
         title: fileName || "合同审核",
       });
+      const poll = async (): Promise<ReviewDocumentResponse> => {
+        const deadline = Date.now() + 25 * 60 * 1000;
+        while (Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 5000));
+          const snap = await getReviewTask(task_key);
+          if (snap.status === "completed" && snap.result) return snap.result;
+          if (snap.status === "failed") throw new Error(snap.error || "AI 审核任务执行失败，请稍后重试");
+        }
+        throw new Error("审核任务超过 25 分钟未完成，请重试");
+      };
+      const data = await poll();
       // 合同原文一并带到审核结果页（逐段展示需要）
       sessionStorage.setItem("lastReviewContent", content.trim());
       navigate("/review/result", {

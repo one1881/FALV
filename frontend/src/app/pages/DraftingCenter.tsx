@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { PageHeader } from "../components/PageHeader";
-import { generateContract, type ContractGenerateRequest } from "../../lib/api/contracts";
+import { generateContract, startGenerateContractAsync, getContractTask, type ContractGenerateRequest } from "../../lib/api/contracts";
 import { TaskProgress } from "../../app/components/TaskProgress";
 
 type DraftType = {
@@ -421,7 +421,19 @@ export function DraftingCenter() {
         requirements,
         description: requirements,
       };
-      const response = await generateContract(request);
+      // 异步提交 + 轮询：规避浏览器对分钟级同步请求的超时限制
+      const { task_key } = await startGenerateContractAsync(request);
+      const poll = async (): Promise<any> => {
+        const deadline = Date.now() + 600_000; // 10 分钟轮询上限
+        while (Date.now() < deadline) {
+          await new Promise((res) => setTimeout(res, 2000));
+          const snap = await getContractTask(task_key);
+          if (snap.status === "completed") return snap.result;
+          if (snap.status === "failed") throw new Error(snap.error || "合同生成失败");
+        }
+        throw new Error("合同生成超时（10 分钟），请联系管理员");
+      };
+      const response = await poll();
       navigate(`/drafting/editor/${response.contract_id}?type=${encodeURIComponent(selectedType.key)}`);
     } catch (err: any) {
       setError(err?.message || "生成失败，请稍后重试");
@@ -474,7 +486,19 @@ export function DraftingCenter() {
           base64: f.base64,
         })),
       };
-      const response = await generateContract(request);
+      // 异步提交 + 轮询：规避浏览器对分钟级同步请求的超时限制
+      const { task_key } = await startGenerateContractAsync(request);
+      const poll = async (): Promise<any> => {
+        const deadline = Date.now() + 600_000; // 10 分钟轮询上限
+        while (Date.now() < deadline) {
+          await new Promise((res) => setTimeout(res, 2000));
+          const snap = await getContractTask(task_key);
+          if (snap.status === "completed") return snap.result;
+          if (snap.status === "failed") throw new Error(snap.error || "合同生成失败");
+        }
+        throw new Error("合同生成超时（10 分钟），请联系管理员");
+      };
+      const response = await poll();
       navigate(`/drafting/editor/${response.contract_id}?type=${encodeURIComponent(selectedType.key)}`);
     } catch (err: any) {
       setError(err?.message || "生成失败，请稍后重试");

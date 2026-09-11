@@ -175,6 +175,29 @@ export async function generateContract(data: ContractGenerateRequest): Promise<C
   return post<ContractGenerateResponse>('/api/contracts/generate', data);
 }
 
+/** 合同生成任务快照（轮询返回） */
+export interface ContractTaskSnapshot {
+  task_id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | string;
+  error?: string | null;
+  result?: ContractGenerateResponse | null;
+  events?: { message: string; timestamp: string; level?: string }[];
+  timings?: Record<string, number>;
+  created_at?: string;
+  updated_at?: string;
+  record_created?: boolean;
+}
+
+/** 异步提交合同生成：立即返回 task_key，规避浏览器/代理对分钟级同步请求的超时限制 */
+export function startGenerateContractAsync(data: ContractGenerateRequest) {
+  return post<{ task_key: string; status: string; poll_url: string }>('/api/contracts/generate-async', data);
+}
+
+/** 轮询合同生成任务快照 */
+export function getContractTask(taskKey: string) {
+  return get<ContractTaskSnapshot>(`/api/contracts/tasks/${encodeURIComponent(taskKey)}`);
+}
+
 export async function submitContractApproval(
   contractId: number,
   data: { summary?: string; risk_score?: number; risk_level?: string } = {},

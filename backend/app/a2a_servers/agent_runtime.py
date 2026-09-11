@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime
 from typing import Any, Dict
@@ -14,6 +15,8 @@ from typing import Any, Dict
 from app.a2a.protocol import AgentCard
 from app.core.config import get_settings
 from app.services.agent_core import DRAFTING_SPEC, REVIEW_SPEC, AgentCore
+
+logger = logging.getLogger(__name__)
 
 settings = get_settings()
 
@@ -80,6 +83,33 @@ def parse_agent_request(message_text: str, kind: str) -> Dict[str, Any]:
     return {"task_type": kind, "action": action, "context": {"requirements": text}}
 
 
+# 交付兜底指令：附加在**完整原始任务**之后用于重生成。
+# 2026-09-10 改造：重生成改为新开线程，故措辞不能出现"你上一条回复"（新线程无上一条）。
+_FINAL_NUDGE = (
+    "\n\n【强制交付】请直接输出完整的最终 JSON 交付物（严格按上文约定的 JSON 契约），"
+    "不要输出计划、解释、过渡句、进度汇报或 markdown 围栏；"
+    "禁止以「我将…」「我已…」这类说明开头，一步到位给出全量内容。"
+)
+
+# 起草结果必须一次生成完成；重复完整生成会把单次耗时和费用翻倍。
+# 审核保留一次重生成，用于处理模型偶发的非结构化输出。
+_DRAFTING_MAX_DELIVERABLE_ATTEMPTS = 1
+_DEFAULT_MAX_DELIVERABLE_ATTEMPTS = 2
+
+
+def _looks_deliverable(text: str) -> bool:
+    """判断最终回复是否像交付物：要么是 JSON 信封，要么是足够长的成文内容。
+
+    glm 系模型偶发'只说不做'——输出'让我先整理上下文'这类计划文字就结束回合，
+    需要识别出来追问续跑，否则下游会把计划文字/兜底模板当成正文存库。
+    """
+    if not text:
+        return False
+    if '"content"' in text or text.strip().startswith("{"):
+        return True
+    return len(text.strip()) > 500  # 纯文本交付至少是成文长度的内容
+
+
 async def run_sub_agent_task(kind: str, request: Dict[str, Any], transport: str = "a2a-server") -> Dict[str, Any]:
     """执行一个子代理任务，返回结构化结果（含真实 A2A 执行轨迹）。
 
@@ -95,10 +125,48 @@ async def run_sub_agent_task(kind: str, request: Dict[str, Any], transport: str 
     agent = _get_agent(kind)
     prompt = _core._build_prompt(request, as_root=False)
     thread_id = f"{kind}-{uuid.uuid4().hex[:12]}"
+    config = {"configurable": {"thread_id": thread_id}}
     raw_result = await agent.ainvoke(
         {"messages": [{"role": "user", "content": prompt}]},
-        config={"configurable": {"thread_id": thread_id}},
+        config=config,
     )
+
+    # 交付物校验 + 兜底重生成。
+    # 2026-09-10 改造：原实现为「同一线程追加追问」，实测上下文雪球严重 ——
+    # 单轮耗时随追问次数单调递增（3'12" → 2'42" → 4'19" → 9'44"，末轮几乎顶到
+    # 600s 超时线），把一次 3 分钟的任务拖成 20 分钟。现改为：不合格时**新开线程 +
+    # 完整原始任务**重生成，让每一轮都跑在干净上下文里；并设硬上限
+    # _MAX_DELIVERABLE_ATTEMPTS 次，超限即如实返回，不再无限续跑空烧算力。
+    attempts = 0
+    max_attempts = (
+        _DRAFTING_MAX_DELIVERABLE_ATTEMPTS
+        if kind == "drafting"
+        else _DEFAULT_MAX_DELIVERABLE_ATTEMPTS
+    )
+    for attempt in range(max_attempts):
+        attempts = attempt + 1
+        state = raw_result.model_dump() if hasattr(raw_result, "model_dump") else raw_result
+        messages = state.get("messages") if isinstance(state, dict) else None
+        final_text = AgentCore._extract_final_text(messages)
+        if _looks_deliverable(final_text):
+            break
+        if attempts >= max_attempts:
+            logger.error(
+                "[agent_runtime] %s 子代理连续 %d 次输出非交付物（%s...），已达上限，放弃重试并如实返回",
+                kind, attempts, final_text[:60],
+            )
+            break
+        logger.warning(
+            "[agent_runtime] %s 子代理输出非交付物（%s...），新线程重生成（放弃同线程追问，避免上下文雪球）",
+            kind, final_text[:60],
+        )
+        thread_id = f"{kind}-{uuid.uuid4().hex[:12]}"
+        config = {"configurable": {"thread_id": thread_id}}
+        raw_result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": prompt + _FINAL_NUDGE}]},
+            config=config,
+        )
+
     normalized = _core._normalize_result(raw_result)
     structured = _core._build_structured_result(request, normalized)
 
@@ -125,5 +193,6 @@ async def run_sub_agent_task(kind: str, request: Dict[str, Any], transport: str 
         structured["agents_executed"] = ["DeepAgentsService", f"{kind}-agent(in-process-fallback)"]
     structured["a2a_transport"] = transport
     structured["a2a_task_id"] = thread_id
+    structured["a2a_attempts"] = attempts  # >1 表示发生过兜底重生成，可供返工率观测
     structured["a2a_completed_at"] = datetime.now().isoformat()
     return structured

@@ -218,6 +218,42 @@ def export_doc_pdf(
                     f'<font color="#854F0B"><b>④ {use_label}</b></font>：{_re.sub(r"[\n\r]+", " ", str(reason))[:280]}'
                 )
 
+                # ⑤ 音频/视频证据追加：重要转写片段（key_moments 为 AI 筛选的定性关键内容；
+                #    无 key_moments 时回退展示全量分段 asr_segments）
+                roles = {}
+                for r in (ai.get("speaker_roles") or []):
+                    if isinstance(r, dict) and r.get("speaker"):
+                        roles[r.get("speaker")] = r.get("role")
+                moms = [m for m in (ai.get("key_moments") or []) if isinstance(m, dict)]
+                segs = ai.get("asr_segments") or []
+
+                def _esc_txt(v):
+                    return _re.sub(r"[\n\r]+", " ", str(v or "")).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+                if moms:
+                    mom_lines = []
+                    for m in moms[:10]:
+                        spk = str(m.get("speaker") or "说话人")
+                        role = roles.get(spk)
+                        spk_txt = f"{spk}（{role}）" if role else spk
+                        why = m.get("why") or ""
+                        mom_lines.append(f"{m.get('time', '?')} {spk_txt}：{_esc_txt(m.get('text'))[:120]}" + (f"——{_esc_txt(why)[:60]}" if why else ""))
+                    right_html += (
+                        '<br/><font color="#854F0B"><b>⑤ 重要转写片段（时间戳+说话人，AI 筛选定性内容，待律师复核）</b></font>：<br/>'
+                        + "<br/>".join(mom_lines)
+                    )
+                elif segs:
+                    seg_lines = []
+                    for sg in segs[:10]:
+                        spk = str(sg.get("speaker") or "说话人")
+                        role = roles.get(spk)
+                        spk_txt = f"{spk}（{role}）" if role else spk
+                        seg_lines.append(f"{sg.get('start', '?')}-{sg.get('end', '?')} {spk_txt}：{_esc_txt(sg.get('text'))[:120]}")
+                    right_html += (
+                        '<br/><font color="#854F0B"><b>⑤ 转写摘录（时间戳+说话人，角色为 AI 归因，待律师复核）</b></font>：<br/>'
+                        + "<br/>".join(seg_lines)
+                    )
+
                 tbl = Table([[media_cell, Paragraph(right_html, ev_body)]], colWidths=[5.5*cm, 11.5*cm])
                 tbl.setStyle(TableStyle([
                     ('VALIGN', (0,0), (-1,-1), 'TOP'),

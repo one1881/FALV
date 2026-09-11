@@ -332,7 +332,7 @@ async def transcribe_audio(audio_path: Path, file_name: str, duration_seconds: f
                     "X-DashScope-Async": "enable",
                     "X-DashScope-OssResourceResolve": "enable",
                 },
-                json={"model": "paraformer-v2", "input": {"file_urls": [f"oss://{key}"]}, "parameters": {"language_hints": ["zh"]}},
+                json={"model": "paraformer-v2", "input": {"file_urls": [f"oss://{key}"]}, "parameters": {"language_hints": ["zh"], "diarization_enabled": True}},
             )
             task_resp.raise_for_status()
             task_id = task_resp.json()["output"]["task_id"]
@@ -344,14 +344,52 @@ async def transcribe_audio(audio_path: Path, file_name: str, duration_seconds: f
                 status = output.get("task_status")
                 if status == "SUCCEEDED":
                     transcript = ""
+                    audio_segments: list[dict[str, Any]] = []
                     for item in output.get("results") or []:
                         transcription_url = item.get("transcription_url") or (item.get("output") or {}).get("transcription_url")
                         if transcription_url:
                             resp = await client.get(transcription_url)
                             resp.raise_for_status()
                             data = resp.json()
-                            transcript = "".join(segment.get("text", "") for segment in data.get("transcripts", []))
+                            # 收集句子级时间戳+说话人，按说话人轮次合并（同主后端 asr_server 逻辑）
+                            raw_sentences: list[dict[str, Any]] = []
+                            for seg in data.get("transcripts", []):
+                                transcript += seg.get("text", "")
+                                for s in seg.get("sentences") or []:
+                                    txt = (s.get("text") or "").strip()
+                                    if txt:
+                                        raw_sentences.append({
+                                            "begin_ms": s.get("begin_time"),
+                                            "end_ms": s.get("end_time"),
+                                            "speaker_id": s.get("speaker_id"),
+                                            "text": txt,
+                                        })
                             break
+                    # 句子 → 说话人轮次（连续同说话人合并），时间戳转 mm:ss
+                    def _ms_ts(ms):
+                        try:
+                            total = int(ms) // 1000
+                        except (TypeError, ValueError):
+                            return "?"
+                        h, rem = divmod(total, 3600)
+                        m, sec = divmod(rem, 60)
+                        return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+                    turns: list[dict[str, Any]] = []
+                    for s in raw_sentences:
+                        spk = f"说话人{(s.get('speaker_id') or 0) + 1}" if s.get("speaker_id") is not None else "说话人待识别"
+                        if turns and turns[-1]["speaker"] == spk:
+                            turns[-1]["_end"] = s["end_ms"]
+                            turns[-1]["text"] += s["text"]
+                        else:
+                            turns.append({"_start": s["begin_ms"], "_end": s["end_ms"], "speaker": spk, "text": s["text"]})
+                    for t in turns[:200]:
+                        audio_segments.append({
+                            "start": _ms_ts(t.pop("_start")),
+                            "end": _ms_ts(t.pop("_end")),
+                            "speaker": t["speaker"],
+                            "text": t["text"],
+                        })
                     return {
                         "provider": "dashscope_paraformer",
                         "mode": "api",
@@ -359,6 +397,7 @@ async def transcribe_audio(audio_path: Path, file_name: str, duration_seconds: f
                         "chunk_seconds": chunk_seconds,
                         "chunk_count": chunk_count,
                         "transcript": transcript,
+                        "audio_segments": audio_segments,
                         "confidence": 0.9,
                     }
                 if status in {"FAILED", "CANCELED"}:
@@ -416,7 +455,9 @@ async def summarize_multimodal(
         "输出要求：\n"
         "1. summary：用一段中文概括整个视频发生了什么（人物、动作、事件、场景），不要用'画面出现…'这种模板；\n"
         "2. key_events：按时间顺序输出 3-8 个关键事件，每一项必须是对象 {\"time\": \"00:00:06\", \"event\": \"具体行为描述\", \"evidence_value\": \"可证明的事实\"}，"
-        "event 描述画面中人物在做什么动作/正在发生什么，不要说'画面出现XX'，time 从给出的时间戳序列中选择最接近的；\n"
+        "event 描述画面中人物在做什么动作/正在发生什么，不要说'画面出现XX'，time 从给出的时间戳序列中选择最接近的；"
+        "重要内容筛选原则：只挑能对案件定性的事件（肢体冲突、物品交付/损毁、承诺、金额、威胁恐吓、催告等），"
+        "寒暄、语气词、无信息量的过场对话和空镜头一律丢弃，宁缺毋滥；\n"
         "3. proof_purpose：这段视频能证明什么事实。\n"
         f"\n视频名称：{video_name}\n视频时长估计：{duration_seconds} 秒\n"
         f"送入画面按顺序对应的时间戳：{json.dumps(frame_timestamps, ensure_ascii=False)}\n"
@@ -511,7 +552,14 @@ async def analyze_video(
         "error": "no_audio_track",
     }
     transcript = transcript_result.get("transcript", "")
-    summary = await summarize_multimodal(file.filename or video_path.name, transcript, objects, key_frames, visual_frames, duration_seconds)
+    audio_segments = transcript_result.get("audio_segments") or []
+    # 带时间戳的转写喂给视觉模型，让 key_events 的时间能与语音对齐
+    transcript_for_vl = (
+        "\n".join(f"[{s['start']}-{s['end']}] {s['speaker']}：{s['text']}" for s in audio_segments[:60])
+        if audio_segments
+        else transcript
+    )
+    summary = await summarize_multimodal(file.filename or video_path.name, transcript_for_vl, objects, key_frames, visual_frames, duration_seconds)
 
     return {
         "duration_seconds": duration_seconds,
@@ -520,6 +568,7 @@ async def analyze_video(
         "audio_extracted": audio_path is not None,
         "audio_path": str(audio_path) if audio_path else None,
         "audio_transcript": transcript,
+        "audio_segments": audio_segments,
         "audio_transcript_result": transcript_result,
         "objects": objects,
         "key_frames": key_frames,

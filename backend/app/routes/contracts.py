@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
-from app.core.database import get_db
+from app.core.database import get_db, SessionLocal
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.schemas.contract import (
@@ -23,6 +23,8 @@ from app.services.workflow_service import (
 from app.models.workflow import ContractWorkflowRun, WorkflowReport
 from typing import Optional
 import logging
+import time
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +253,7 @@ async def generate_contract(
         db.refresh(contract)
         db.refresh(approval_workflow)
 
+        logger.info(f"Contract generation completed: {contract.id}")
         return ContractGenerateResponse(
             contract_id=contract.id,
             contract_number=contract.contract_number,
@@ -296,6 +299,123 @@ async def generate_contract(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"合同生成失败: {str(e)}"
         )
+
+
+@router.post("/generate-async")
+async def generate_contract_async(
+    request: ContractGenerateRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """异步提交合同生成任务：立即返回 task_key，前端轮询进度。
+
+    起草是分钟级 A2A 链路（主控决策 + 子代理生成），同步等待容易被浏览器/代理
+    掐断报"请求超时"，改为提交后轮询，前端还能展示实时进度。
+    """
+    service = get_deepagents_service()
+    task_key = f"drafting:{request.contract_type}:{current_user.id}:{uuid.uuid4().hex[:8]}"
+    input_data = {
+        "party_id": request.party_id,
+        "customer_name": request.customer_name,
+        "contract_type": request.contract_type,
+        "contract_amount": float(request.amount) if request.amount else 0,
+        "jurisdiction": request.jurisdiction or "中国",
+        "industry": request.industry or "通用",
+        "payment_terms": {},
+        "delivery_schedule": {},
+        "description": request.description,
+        "requirements": request.requirements,
+        "materials_text": request.materials_text,
+        "materials": request.materials or [],
+    }
+    agent_request = {
+        "task_type": "drafting",
+        "action": "generate_document_from_case",
+        "context": input_data,
+    }
+    snapshot = service.start_execute(task_key, agent_request)
+    return {
+        "task_key": task_key,
+        "status": snapshot.get("status", "running"),
+        "poll_url": f"/api/contracts/tasks/{task_key}",
+    }
+
+
+@router.get("/tasks/{task_key}")
+async def get_contract_task(
+    task_key: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """轮询合同生成任务快照：status=completed 时返回完整结果并落库（含 contract_id）。"""
+    service = get_deepagents_service()
+    task = service.get_task(task_key)
+    if task is None:
+        raise HTTPException(status_code=404, detail="任务不存在或已过期（服务可能重启过）")
+
+    # 属主校验：task_key 形如 drafting:{contract_type}:{user_id}:{rand}
+    parts = task_key.split(":")
+    if len(parts) >= 3 and str(current_user.id) != parts[2]:
+        raise HTTPException(status_code=403, detail="无权查看该任务")
+
+    # 完成后幂等落一条合同记录（与同步链路行为一致）
+    if task.get("status") == "completed" and not task.get("record_created"):
+        result = task.get("result")
+        if isinstance(result, dict) and result:
+            ctx = task.get("context") or {}
+            try:
+                # 用独立会话落库，避免与主循环事务冲突
+                db_session = SessionLocal()
+                try:
+                    generation_result = result.get("result", {})
+                    content_block = generation_result.get("content", {}) if isinstance(generation_result, dict) else {}
+                    generated_content = content_block.get("content") if isinstance(content_block, dict) else generation_result.get("content", "")
+                    generated_content = (generated_content or "").strip() if isinstance(generated_content, str) else str(generated_content or "").strip()
+
+                    if generated_content:
+                        contract_type = ctx.get("contract_type", "未知类型")
+                        customer_name = ctx.get("customer_name", "未命名")
+                        contract = ContractService(db_session).create_contract(ContractCreate(
+                            title=f"{contract_type} - {customer_name}",
+                            contract_type=contract_type,
+                            customer_name=customer_name,
+                            amount=ctx.get("contract_amount"),
+                            content=generated_content,
+                        ), current_user.id)
+
+                        risk_result = generation_result.get("risk_assessment", {}) if isinstance(generation_result, dict) else {}
+                        save_workflow_run(db_session, contract, current_user.id, ctx, result)
+                        approval_workflow = create_approval_workflow(
+                            db_session, contract, current_user,
+                            result.get("contract_summary", {}).get("summary") if isinstance(result.get("contract_summary"), dict) else ctx.get("description", "")[:500],
+                            risk_result.get("overall", {}).get("score") if isinstance(risk_result, dict) else None,
+                            risk_result.get("overall", {}).get("level") if isinstance(risk_result, dict) else None,
+                        )
+                        db_session.commit()
+                        db_session.refresh(contract)
+                        db_session.refresh(approval_workflow)
+
+                        # 记录合同 ID 到任务快照
+                        task_obj = service._tasks.get(task_key)
+                        if task_obj is not None:
+                            task_obj.record_created = True
+                            if task_obj.result:
+                                task_obj.result["contract_id"] = contract.id
+                                task_obj.result["contract_number"] = contract.contract_number
+                                task_obj.result["workflow_id"] = approval_workflow.workflow_id
+                        task = service.get_task(task_key) or task
+                        logger.info(f"合同已落库 contract_id={contract.id} task_key={task_key}")
+                finally:
+                    db_session.close()
+            except Exception as e:
+                logger.exception(f"合同落库失败 task_key={task_key}: {e}")
+                # 落库失败不阻断轮询，前端拿到 result 后可自行处理或重试
+
+    # 轮询响应瘦身：上下文不再随每次轮询回传
+    slim = dict(task)
+    ctx = slim.get("context") or {}
+    if isinstance(ctx, dict) and len(str(ctx)) > 500:
+        slim["context"] = {"contract_type": ctx.get("contract_type"), "customer_name": ctx.get("customer_name")}
+    return slim
 
 
 @router.get("", response_model=ContractListResponse)

@@ -52,6 +52,29 @@ export async function reviewDocument(data: ReviewDocumentRequest): Promise<Revie
   return post<ReviewDocumentResponse>('/api/review/review-document', data);
 }
 
+/** 审核任务快照（轮询返回） */
+export interface ReviewTaskSnapshot {
+  task_id: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | string;
+  error?: string | null;
+  result?: ReviewDocumentResponse | null;
+  events?: { message: string; timestamp: string; level?: string }[];
+  created_at?: string;
+  updated_at?: string;
+  review_record_id?: number | null;
+  record_created?: boolean;
+}
+
+/** 异步提交审核：立即返回 task_key，规避浏览器/代理对分钟级同步请求的超时限制 */
+export function startReviewDocumentAsync(data: ReviewDocumentRequest) {
+  return post<{ task_key: string; status: string; poll_url: string }>('/api/review/review-document-async', data);
+}
+
+/** 轮询审核任务快照 */
+export function getReviewTask(taskKey: string) {
+  return get<ReviewTaskSnapshot>(`/api/review/tasks/${encodeURIComponent(taskKey)}`);
+}
+
 /** 历史审查记录（一条 = 一次 AI 审查的完整结果） */
 export interface ReviewRecordItem {
   id: number;

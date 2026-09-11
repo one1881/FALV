@@ -1,4 +1,5 @@
 import logging
+import httpx
 from openai import OpenAI
 from app.core.config import get_settings
 
@@ -7,12 +8,26 @@ settings = get_settings()
 
 
 class AIService:
-    """AI服务类，用于合同分析"""
+    """AI服务类，用于合同分析
+
+    注意：OpenAI 同步客户端在 async 路由里直接调用会阻塞整个 FastAPI 事件循环
+    （单次调用最长 timeout+retries，期间所有请求全部冻结）。因此：
+    1. 客户端必须设 timeout 和 max_retries，禁止用 SDK 默认值（600s×3 次）；
+    2. async 链路请用 *_async 包装方法（线程池执行），不要直接调同步方法。
+    """
+
+    # 强制 trust_env=False：不读 HTTP_PROXY/HTTPS_PROXY，避免沙箱/工具进程注入的
+    # 本地代理（127.0.0.1:8279）把 DashScope 模型请求绕死（根因修复 2026-09-10）。
+    _HTTP_TIMEOUT = httpx.Timeout(120.0, connect=20.0)
 
     def __init__(self):
+        self._http_client = httpx.Client(trust_env=False, timeout=self._HTTP_TIMEOUT)
         self.client = OpenAI(
             api_key=settings.primary_llm_api_key,
             base_url=self._normalize_base_url(settings.primary_llm_api_url),
+            timeout=120,
+            max_retries=1,
+            http_client=self._http_client,
         )
         # 多模态视觉客户端（Qwen-VL，用于视频/图片画面理解）
         self.vl_client = None
@@ -22,6 +37,9 @@ class AIService:
                 self.vl_client = OpenAI(
                     api_key=settings.QWEN_VL_API_KEY,
                     base_url=base_url,
+                    timeout=120,
+                    max_retries=1,
+                    http_client=self._http_client,
                 )
             except Exception as e:
                 logger.error(f"Qwen-VL 客户端初始化失败: {e}")
@@ -147,11 +165,27 @@ class AIService:
             '"proof_purpose":"该证据能证明的法律事实（一句 30-80 字）",'
             '"risk_notes":["该证据的局限性或需交叉验证的点"],'
             '"need_confirm":["律师需要进一步确认的事实/时间/地点/主体"],'
+            '"key_moments":[{"time":"mm:ss","speaker":"说话人N（纯画面事件填空字符串）","text":"原话摘录或画面关键行为描述","why":"一句话说明为什么关键"}],'
             '"evidence_level":"A/B/C 三档之一"}'
             "\nkey_info 各列表按视频实际内容填写，没有的留空数组但至少一个非空。"
+            "\nkey_moments 为重要内容筛选：若上下文含音频转写，只挑出**能对案件定性**的语音片段"
+            "（承诺/承认/否认、金额、日期期限、威胁恐吓、催告、身份信息、关键抗辩等），"
+            "寒暄、语气词、无信息量的过场对话一律丢弃，宁缺毋滥；time 使用转写自带的时间戳，"
+            "speaker 按转写标注填写；画面中的关键行为（如肢体冲突、物品交付、损毁动作）也可纳入，"
+            "time 按该画面所在的时间段估计；没有关键内容时输出空数组，禁止编造不存在的语句。"
             "evidence_level 判定标准：A=直接证明案件关键事实；B=辅助证明背景经过；C=仅供线索参考。"
         )
         return self._call_vl_json(frames_base64, ["image/jpeg"] * len(frames_base64), prompt)
+
+    # ---------- 异步包装：同步 OpenAI 调用丢进线程池，避免阻塞事件循环 ----------
+
+    async def describe_image_async(self, image_base64: str, prompt: str = "", mime: str = "image/jpeg") -> dict:
+        import asyncio
+        return await asyncio.to_thread(self.describe_image, image_base64, prompt, mime)
+
+    async def describe_video_frames_async(self, frames_base64: list, yolo_objects_summary: str, file_name: str = "", max_frames: int = 6) -> dict:
+        import asyncio
+        return await asyncio.to_thread(self.describe_video_frames, frames_base64, yolo_objects_summary, file_name, max_frames)
 
     def _default_image_prompt(self) -> str:
         return (

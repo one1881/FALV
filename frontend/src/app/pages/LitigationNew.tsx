@@ -231,7 +231,7 @@ export function LitigationNew() {
         visual_description: ai?.visual_description,
         key_facts: ai?.key_facts,
         file_url: b.material_id ? `/api/litigation/intake/${intakeId}/materials/${b.material_id}/file` : undefined,
-        confirmed: b.status === "confirmed",
+        confirmed: b.status === "confirmed" ? true : b.status === "removed" ? false : null,
       };
     });
   }, [blocks]);
@@ -715,9 +715,10 @@ export function LitigationNew() {
             onConfirmItem={async (id, status) => {
               const block = blocks.find((b) => b.block_id === id);
               if (!block) return;
+              const backendStatus = status === true ? "confirmed" : status === false ? "removed" : "pending";
               try {
-                await confirmIntakeBlock(intakeId, { block_id: id, status: status ? "confirmed" : "removed", confirmed_result: block.ai_result || block.data || null });
-                setBlocks((prev) => prev.map((b) => (b.block_id === id ? { ...b, status: status ? "confirmed" : "removed" } : b)));
+                await confirmIntakeBlock(intakeId, { block_id: id, status: backendStatus, confirmed_result: block.ai_result || block.data || null });
+                setBlocks((prev) => prev.map((b) => (b.block_id === id ? { ...b, status: backendStatus } : b)));
               } catch (e: any) {
                 console.error("确认失败", e);
               }

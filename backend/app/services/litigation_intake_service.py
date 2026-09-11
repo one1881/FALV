@@ -2,15 +2,70 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
+import asyncio
 import base64
 import hashlib
 import json
+import logging
 import shutil
+import subprocess
 
 from fastapi import UploadFile
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _probe_video_codec(file_path: Path) -> Optional[str]:
+    """用 ffprobe 读视频流编码名，失败返回 None。"""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=codec_name", "-of", "json", str(file_path)],
+            capture_output=True, timeout=20,
+        )
+        data = json.loads(out.stdout.decode("utf-8", "ignore") or "{}")
+        streams = data.get("streams") or []
+        return streams[0].get("codec_name") if streams else None
+    except Exception:
+        return None
+
+
+def _transcode_to_h264_sync(file_path: Path) -> bool:
+    """HEVC 等 Chrome 解不动的编码 → H.264 mp4（原地替换）。成功返回 True。"""
+    tmp_path = file_path.with_suffix(".h264.mp4")
+    cmd = [
+        "ffmpeg", "-y", "-i", str(file_path),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
+        str(tmp_path),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=600)
+        if proc.returncode == 0 and tmp_path.exists() and tmp_path.stat().st_size > 0:
+            shutil.move(str(tmp_path), str(file_path))
+            return True
+        tmp_path.unlink(missing_ok=True)
+        return False
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        return False
+
+
+# Chrome(Windows 无 HEVC 扩展) 播不了的常见编码 → 上传时转 H.264
+_NEED_TRANSCODE = {"hevc", "hev1", "h265", "mpeg4", "prores"}
+
+
+async def _ensure_browser_playable(file_path: Path) -> Optional[str]:
+    """视频落盘后检查编码；浏览器播不了就转 H.264。返回动作说明（或 None）。"""
+    codec = await asyncio.to_thread(_probe_video_codec, file_path)
+    if not codec or codec not in _NEED_TRANSCODE:
+        return None
+    ok = await asyncio.to_thread(_transcode_to_h264_sync, file_path)
+    logger.info("video transcode %s codec=%s -> h264 ok=%s", file_path.name, codec, ok)
+    return f"{codec}->h264" if ok else None
 
 # 图片(物体类)识别 prompt：让 QWEN-VL 直接输出一句话凝练摘要，禁止 ###/分点清单
 ONE_LINE_IMG_PROMPT = (
@@ -77,6 +132,36 @@ def _parse_vl_json(text: str) -> tuple[str, str, dict]:
     if s:
         return (s, d, {})
     return (text.strip(), "", {})
+
+
+def _parse_vl_useful(text: str) -> bool | None:
+    """从 VL 返回文本里挖 useful（有利/不利）AI 预判。
+
+    约定模型输出 "useful": "有利|不利|无法判断"（也兼容 true/false/null）。
+    解析失败或模型填"无法判断"一律返回 None（=待定，由律师判断）。
+    """
+    import json
+    if not text:
+        return None
+    candidate = text.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.strip("`")
+        if candidate.startswith("json"):
+            candidate = candidate[4:].strip()
+    raw = None
+    try:
+        data = json.loads(candidate)
+        if isinstance(data, dict):
+            raw = data.get("useful")
+    except Exception:
+        m = re.search(r'"useful"\s*:\s*"?\s*(有利|不利|无法判断|true|false|null)', candidate)
+        if m:
+            raw = m.group(1)
+    if raw in (True, "true", "有利"):
+        return True
+    if raw in (False, "false", "不利"):
+        return False
+    return None
 
 
 from app.models.litigation import (
@@ -215,7 +300,7 @@ class LitigationIntakeService:
             "如果图片主要是文字、截图、票据、合同扫描件、聊天记录，返回 text；"
             "如果主要是实物、现场、人物、车辆、货物、环境，返回 object。"
         )
-        result = ai.describe_image(image_b64, prompt, mime or "image/jpeg")
+        result = await ai.describe_image_async(image_b64, prompt, mime or "image/jpeg")
         if not result.get("success"):
             return {"category": "object", "confidence": 0.5, "reason": result.get("error", "分类失败")}
         parsed = self._try_load_json(result.get("description", ""))
@@ -286,6 +371,21 @@ class LitigationIntakeService:
             obj_lines.append(f"- {label} ×{count}（置信度 {conf:.2f}）")
         yolo_summary = "YOLO 检测到的对象分布：\n" + "\n".join(obj_lines) if obj_lines else ""
 
+        # 1.5) 音轨转写（带时间戳+说话人，来自 :9001 audio_segments）拼进 VL 上下文，
+        #      让 key_events 的时间线能和语音对齐；同时透传 asr_segments 给前端/PDF
+        audio_segments = yolo_result.get("audio_segments") or []
+        audio_ctx = ""
+        transcript_text = ""
+        if audio_segments:
+            audio_lines = [
+                f"[{s.get('start')}-{s.get('end')}] {s.get('speaker')}：{s.get('text')}"
+                for s in audio_segments[:40] if isinstance(s, dict)
+            ]
+            if audio_lines:
+                audio_ctx = "\n音频转写（带时间戳与说话人）：\n" + "\n".join(audio_lines)
+                # 前端对齐：视频卡片"查看转写全文"读 transcript 字段，与音频链路同构
+                transcript_text = "\n".join(audio_lines)
+
         # 2) 取关键帧（最多 6 张）拼 base64
         key_frames = yolo_result.get("key_frames") or []
         frames_base64: list[str] = []
@@ -318,7 +418,7 @@ class LitigationIntakeService:
 
         # 3) 调 Qwen-VL 二次摘要
         if frames_base64:
-            vl_result = ai.describe_video_frames(frames_base64, yolo_summary, file_name, max_frames=6)
+            vl_result = await ai.describe_video_frames_async(frames_base64, yolo_summary + audio_ctx, file_name, max_frames=6)
             if vl_result.get("ok"):
                 data = vl_result["data"]
                 # 4) 合并到 parsed（保留 YOLO 抽帧结构 + 替换 summary 类）
@@ -327,6 +427,23 @@ class LitigationIntakeService:
                 merged["mode"] = "api"
                 merged["vl_objects_context"] = yolo_summary
                 merged["vl_input_frames"] = len(frames_base64)
+                merged["asr_segments"] = audio_segments
+                if transcript_text:
+                    merged["transcript"] = transcript_text
+                # 重要内容落地：VL 筛选的 key_moments（定性语音/画面片段）→ 前端"关键时间点"
+                km = [m for m in (data.get("key_moments") or []) if isinstance(m, dict)]
+                merged["key_moments"] = km
+                if km:
+                    merged["key_events"] = [
+                        {
+                            "time": m.get("time") or "未知",
+                            "event": (
+                                (f"{m.get('speaker', '')}：" if m.get("speaker") else "")
+                                + f"{m.get('text', '')}（{m.get('why', '')}）"
+                            ),
+                        }
+                        for m in km
+                    ]
                 merged["summary"] = data.get("summary") or merged.get("summary", "")
                 merged["detailed"] = data.get("detailed") or ""
                 merged["key_info"] = data.get("key_info") if isinstance(data.get("key_info"), dict) else merged.get("key_info", {})
@@ -345,6 +462,10 @@ class LitigationIntakeService:
                 yolo_result["evidence_level"] = "C"
                 yolo_result["vl_objects_context"] = yolo_summary
                 yolo_result["vl_input_frames"] = len(frames_base64)
+                yolo_result["asr_segments"] = audio_segments
+                yolo_result["key_moments"] = []
+                if transcript_text:
+                    yolo_result["transcript"] = transcript_text
                 return yolo_result
         else:
             # 没有抽到帧，YOLO fallback
@@ -352,6 +473,10 @@ class LitigationIntakeService:
             yolo_result["evidence_level"] = "C"
             yolo_result["vl_objects_context"] = yolo_summary
             yolo_result["vl_input_frames"] = 0
+            yolo_result["asr_segments"] = audio_segments
+            yolo_result["key_moments"] = []
+            if transcript_text:
+                yolo_result["transcript"] = transcript_text
             return yolo_result
 
     async def save_uploaded_files(self, intake: LitigationIntake, files: List[UploadFile]) -> List[LitigationMaterial]:
@@ -380,6 +505,9 @@ class LitigationIntakeService:
             file_path = file_dir / f"{uuid4().hex}_{safe_name}"
             file_path.write_bytes(content)
             file_type = self.detect_file_type(safe_name, file.content_type)
+            if file_type == "video":
+                # HEVC 等编码 Chrome 播不了（无画面只剩音轨），上传时统一转 H.264
+                await _ensure_browser_playable(file_path)
             material = LitigationMaterial(
                 material_id=material_id,
                 intake_id=intake.id,
@@ -481,10 +609,13 @@ class LitigationIntakeService:
                         prompt = (
                             "这是一张法律证据图片（偏文字类）。请用严格 JSON 输出："
                             '{"summary":"一句话概括该图证明的核心事实","detailed":"100-220字详细描述：可见文字、关键信息、证据意义、人物/物体/动作/场景，分句即可不要分点",'
-                            '"key_info":{"人物":[],"机构/地点":[],"金额":[],"日期时间":[],"可见文字/关键承诺":[]}}，'
+                            '"key_info":{"人物":[],"机构/地点":[],"金额":[],"日期时间":[],"可见文字/关键承诺":[]},'
+                            '"useful":"有利|不利|无法判断"}，'
                             "key_info 各列表按图中实际内容填写，没有的留空数组，但至少一个列表非空。"
+                            "useful 为 AI 预判（供律师参考、待律师复核）：仅依据图中文字内容判断该证据对委托人更有利还是不利，"
+                            "内容清晰倾向明确才填有利/不利，看不出来或两可时填无法判断，禁止编造依据。"
                         )
-                        desc = ai.describe_image(b64, prompt, material.mime_type or "image/jpeg")
+                        desc = await ai.describe_image_async(b64, prompt, material.mime_type or "image/jpeg")
                         visual = (desc.get("description") or "").strip()
                         one_line_summary, detailed, vl_key_info = _parse_vl_json(visual)
                         if not detailed or detailed == one_line_summary:
@@ -498,7 +629,7 @@ class LitigationIntakeService:
                             "proof_purpose": "证明图片所反映的现场、实物或画面内容",
                             "risk_notes": ["图片无法单独证明拍摄时间地点，需结合原始属性或证人说明"],
                             "need_confirm": ["画面内容与本案的关联性", "拍摄时间与地点"],
-                            "useful": None,
+                            "useful": _parse_vl_useful(visual),
                             "evidence_level": "C",
                             "classification": {"category": category},
                             "visual_description": detailed or visual,
@@ -506,9 +637,13 @@ class LitigationIntakeService:
                 elif material.file_type == "audio":
                     trans = await asr_server._transcribe_audio(str(path), material.file_name)
                     text = trans.get("transcript") or ""
-                    parsed = await qwen._extract_key_info("audio", text, {"file_name": material.file_name})
                     # 保留 ASR 原始转写（前端音频卡片"查看转写全文"用）+ 关键时间戳块
                     segments = trans.get("segments") or []
+                    # 带时间戳/说话人的分段转写喂给 Qwen，供其做说话人角色归因
+                    extract_ctx = {"file_name": material.file_name}
+                    if segments:
+                        extract_ctx["asr_segments"] = segments[:40]
+                    parsed = await qwen._extract_key_info("audio", text, extract_ctx)
                     parsed = {
                         **parsed,
                         "transcript": text,
@@ -519,8 +654,15 @@ class LitigationIntakeService:
                         "asr_segments": segments,
                         "asr_key_info": trans.get("key_info") or {},
                     }
+                    # 重要内容落地：key_moments（AI 筛选的定性关键片段）→ 前端"关键时间点"
+                    km = [m for m in (parsed.get("key_moments") or []) if isinstance(m, dict)]
+                    if km:
+                        parsed["key_events"] = [
+                            {"time": m.get("time") or "未知", "event": f"{m.get('speaker', '')}：{m.get('text', '')}（{m.get('why', '')}）"}
+                            for m in km
+                        ]
                     # ASR 返回 segments 为空时，按标点切分给前端"关键时间点"用（无真实时间戳但给段落分隔）
-                    if not segments and text:
+                    elif not segments and text:
                         chunks = [c.strip() for c in text.replace("\n", "。").split("。") if c.strip()]
                         parsed["key_events"] = [
                             {"time": f"段落{i+1}", "event": c[:80] + ("..." if len(c) > 80 else "")}
@@ -533,7 +675,7 @@ class LitigationIntakeService:
                     parsed = await self._summarize_video_with_vl(parsed, path, material.file_name, ai)
                 else:
                     b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
-                    desc = ai.describe_image(b64, "请将这份法律证据材料按严格 JSON 解析，输出 summary、detailed、key_info、proof_purpose、risk_notes、need_confirm、useful、evidence_level。", material.mime_type or "application/octet-stream")
+                    desc = await ai.describe_image_async(b64, "请将这份法律证据材料按严格 JSON 解析，输出 summary、detailed、key_info、proof_purpose、risk_notes、need_confirm、useful、evidence_level。", material.mime_type or "application/octet-stream")
                     visual = (desc.get("description") or "").strip()
                     summary, detailed = _parse_vl_json(visual)
                     if not detailed or detailed == summary:
@@ -639,10 +781,13 @@ class LitigationIntakeService:
                     prompt = (
                         "这是一张法律证据图片（偏文字类）。请用严格 JSON 输出："
                         '{"summary":"一句话概括该图证明的核心事实","detailed":"100-220字详细描述：可见文字、关键信息、证据意义、人物/物体/动作/场景，分句即可不要分点",'
-                        '"key_info":{"人物":[],"机构/地点":[],"金额":[],"日期时间":[],"可见文字/关键承诺":[]}}，'
+                        '"key_info":{"人物":[],"机构/地点":[],"金额":[],"日期时间":[],"可见文字/关键承诺":[]},'
+                        '"useful":"有利|不利|无法判断"}，'
                         "key_info 各列表按图中实际内容填写，没有的留空数组，但至少一个列表非空。"
+                        "useful 为 AI 预判（供律师参考、待律师复核）：仅依据图中文字内容判断该证据对委托人更有利还是不利，"
+                        "内容清晰倾向明确才填有利/不利，看不出来或两可时填无法判断，禁止编造依据。"
                     )
-                    desc = ai.describe_image(b64, prompt, material.mime_type or "image/jpeg")
+                    desc = await ai.describe_image_async(b64, prompt, material.mime_type or "image/jpeg")
                     visual = (desc.get("description") or "").strip()
                     one_line_summary, detailed, vl_key_info = _parse_vl_json(visual)
                     if not detailed or detailed == one_line_summary:
@@ -656,7 +801,7 @@ class LitigationIntakeService:
                         "proof_purpose": "证明图片所反映的现场、实物或画面内容",
                         "risk_notes": ["图片无法单独证明拍摄时间地点，需结合原始属性或证人说明"],
                         "need_confirm": ["画面内容与本案的关联性", "拍摄时间与地点"],
-                        "useful": None,
+                        "useful": _parse_vl_useful(visual),
                         "evidence_level": "C",
                         "classification": {"category": category},
                         "visual_description": detailed or visual,
@@ -664,8 +809,11 @@ class LitigationIntakeService:
             elif material.file_type == "audio":
                 trans = await asr_server._transcribe_audio(str(path), material.file_name)
                 text = trans.get("transcript") or ""
-                parsed = await qwen._extract_key_info("audio", text, {"file_name": material.file_name})
                 segments = trans.get("segments") or []
+                extract_ctx = {"file_name": material.file_name}
+                if segments:
+                    extract_ctx["asr_segments"] = segments[:40]
+                parsed = await qwen._extract_key_info("audio", text, extract_ctx)
                 parsed = {
                     **parsed,
                     "transcript": text,
@@ -676,7 +824,13 @@ class LitigationIntakeService:
                     "asr_segments": segments,
                     "asr_key_info": trans.get("key_info") or {},
                 }
-                if not segments and text:
+                km = [m for m in (parsed.get("key_moments") or []) if isinstance(m, dict)]
+                if km:
+                    parsed["key_events"] = [
+                        {"time": m.get("time") or "未知", "event": f"{m.get('speaker', '')}：{m.get('text', '')}（{m.get('why', '')}）"}
+                        for m in km
+                    ]
+                elif not segments and text:
                     chunks = [c.strip() for c in text.replace("\n", "。").split("。") if c.strip()]
                     parsed["key_events"] = [
                         {"time": f"段落{i+1}", "event": c[:80] + ("..." if len(c) > 80 else "")}
@@ -688,7 +842,7 @@ class LitigationIntakeService:
                 parsed = await self._summarize_video_with_vl(parsed, path, material.file_name, ai)
             else:
                 b64 = base64.b64encode(path.read_bytes()).decode("utf-8")
-                desc = ai.describe_image(b64, "请将这份法律证据材料按严格 JSON 解析，输出 summary、detailed、key_info、proof_purpose、risk_notes、need_confirm、useful、evidence_level。", material.mime_type or "application/octet-stream")
+                desc = await ai.describe_image_async(b64, "请将这份法律证据材料按严格 JSON 解析，输出 summary、detailed、key_info、proof_purpose、risk_notes、need_confirm、useful、evidence_level。", material.mime_type or "application/octet-stream")
                 visual = (desc.get("description") or "").strip()
                 summary, detailed = _parse_vl_json(visual)
                 if not detailed or detailed == summary:
@@ -856,7 +1010,16 @@ class LitigationIntakeService:
         assessment = assessment or {}
         evidence_catalog = []
         materials = []
-        for index, material in enumerate(intake.materials, start=1):
+        # 排除规则：律师已排除（块全部 removed）或上传预检被过滤（analysis_status=rejected）的材料不进归档
+        archivable = []
+        for material in intake.materials:
+            if material.analysis_status == "rejected":
+                continue
+            blocks = list(material.confirmation_blocks or [])
+            if blocks and all((b.status or "pending") == "removed" for b in blocks):
+                continue
+            archivable.append(material)
+        for index, material in enumerate(archivable, start=1):
             latest = material.analysis_results[-1] if material.analysis_results else None
             structured = latest.structured_result if latest and isinstance(latest.structured_result, dict) else {}
             summary = structured.get("summary") or latest.raw_text if latest else ""

@@ -17,6 +17,7 @@ import {
   ThumbsUp,
   ThumbsDown,
   CheckCheck,
+  RotateCcw,
   FileText,
   ListFilter,
   X,
@@ -43,6 +44,7 @@ export function MediaPlayer({ url, variant, className, onClick }: {
 }) {
   const [src, setSrc] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [videoExpanded, setVideoExpanded] = useState(false);
   useEffect(() => {
     let alive = true;
     const token = localStorage.getItem("access_token");
@@ -69,7 +71,19 @@ export function MediaPlayer({ url, variant, className, onClick }: {
     return <img src={src} alt="证据大图" className="max-h-[85vh] max-w-[90vw] rounded-2xl object-contain shadow-2xl" onClick={(e) => e.stopPropagation()} />;
   }
   if (variant === "video") {
-    return <video key={src} src={src} controls preload="metadata" className={className || "mt-2 max-h-64 w-full rounded-xl border border-border bg-black/5"} />;
+    // 默认收起为矮窗（不占版面），点击播放即展开成大窗看清画面
+    return (
+      <video
+        key={src}
+        src={src}
+        controls
+        preload="metadata"
+        onPlay={() => setVideoExpanded(true)}
+        className={className || (videoExpanded
+          ? "mt-2 max-h-[70vh] w-full rounded-xl border border-border bg-black object-contain shadow-lg transition-all duration-300"
+          : "mt-2 max-h-44 w-full cursor-pointer rounded-xl border border-border bg-black object-cover transition-all duration-300")}
+      />
+    );
   }
   return <audio key={src} src={src} controls preload="metadata" className={className || "mt-2 w-full"} />;
 }
@@ -182,8 +196,8 @@ export function LitigationConfirmPreview({
 }: {
   /** 不传则用内置 mock；传则使用真实数据（如从后端 confirmation_blocks 适配而来） */
   initialItems?: EvidenceItem[];
-  /** 单条确认回调（不传则组件内部仅本地切换） */
-  onConfirmItem?: (id: string, status: boolean) => void | Promise<void>;
+  /** 单条确认回调：true=确认 / false=排除 / null=恢复待确认（不传则组件内部仅本地切换） */
+  onConfirmItem?: (id: string, status: boolean | null) => void | Promise<void>;
   /** 切换有利/不利回调（不传则组件内部仅本地切换） */
   onSetUsefulItem?: (id: string, useful: Useful) => void;
   /** 一键确认当前视图回调；不传则用本地 setItems */
@@ -254,8 +268,8 @@ export function LitigationConfirmPreview({
     confirmed: items.filter((i) => i.confirmed === true).length,
   };
 
-  // 确认单条：优先调外部，否则本地
-  const confirm = (id: string, status: boolean) => {
+  // 确认单条：优先调外部，否则本地（true=确认 / false=排除 / null=恢复待确认）
+  const confirm = (id: string, status: boolean | null) => {
     if (onConfirmItem) {
       void onConfirmItem(id, status);
     } else {
@@ -463,14 +477,15 @@ function ImageRow({
   item, expandedId, setExpandedId, onConfirm, onSetUseful, readOnly = false, onPreview,
 }: {
   item: EvidenceItem; expandedId: string | null; setExpandedId: (v: string | null) => void;
-  onConfirm: (id: string, status: boolean) => void;
+  onConfirm: (id: string, status: boolean | null) => void;
   onSetUseful: (id: string, u: Useful) => void;
   readOnly?: boolean;
   onPreview?: (url: string) => void;
 }) {
   const expanded = expandedId === item.id;
+  const excluded = item.confirmed === false; // 已排除：既非有利也非不利，不进归档，只展示"已排除"一个状态
   return (
-    <div className={cn("p-5", expanded && "bg-accent/30")}>
+    <div className={cn("p-5 transition-opacity", excluded && "opacity-60", expanded && !excluded && "bg-accent/30")}>
       <div className="flex flex-wrap items-center gap-4">
         {item.file_url ? (
           <MediaPlayer url={item.file_url} variant="thumb" onClick={() => onPreview?.(item.file_url!)} />
@@ -483,64 +498,89 @@ function ImageRow({
           <div className="flex flex-wrap items-center gap-2">
             <span className="truncate text-sm font-black text-foreground">{item.name}</span>
             <EvidenceLevelBadge level={item.evidence_level} />
-            <UsefulBadge useful={item.useful} />
-            {item.confirmed === true && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[9px] font-black text-emerald-700">
-                <CheckCircle2 className="h-3 w-3" /> 已确认
-              </span>
-            )}
-            {item.confirmed === false && (
+            {excluded ? (
               <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[9px] font-black text-rose-700">
                 <XCircle className="h-3 w-3" /> 已排除
               </span>
+            ) : (
+              <>
+                <UsefulBadge useful={item.useful} />
+                {item.confirmed === true && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[9px] font-black text-emerald-700">
+                    <CheckCircle2 className="h-3 w-3" /> 已确认
+                  </span>
+                )}
+              </>
             )}
           </div>
           <p className="mt-1.5 line-clamp-2 text-xs font-medium leading-6 text-foreground/80">{cleanSummary(item.summary, 110)}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {/* 有利/不利切换（只读模式只展示当前状态，不可切换） */}
-          {readOnly ? (
-            <span
-              className={cn(
-                "inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[11px] font-black",
-                item.useful === true
-                  ? "bg-emerald-500 text-white"
-                  : item.useful === false
-                  ? "bg-rose-500 text-white"
-                  : "bg-secondary text-muted-foreground",
-              )}
-            >
-              {item.useful === true ? <ThumbsUp className="h-3 w-3" /> : <ThumbsDown className="h-3 w-3" />}
-            </span>
+          {excluded ? (
+            !readOnly && (
+              <button
+                onClick={() => onConfirm(item.id, null)}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-4 py-1.5 text-[11px] font-black text-muted-foreground transition-colors hover:bg-accent"
+              >
+                <RotateCcw className="h-3.5 w-3.5" /> 取消排除
+              </button>
+            )
           ) : (
-            <div className="flex overflow-hidden rounded-full border border-border">
-              <button
-                onClick={() => onSetUseful(item.id, true)}
-                className={cn(
-                  "px-3 py-1.5 text-[11px] font-black transition-colors",
-                  item.useful === true ? "bg-emerald-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
-                )}
-              >
-                <ThumbsUp className="h-3 w-3" />
-              </button>
-              <button
-                onClick={() => onSetUseful(item.id, false)}
-                className={cn(
-                  "px-3 py-1.5 text-[11px] font-black transition-colors",
-                  item.useful === false ? "bg-rose-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
-                )}
-              >
-                <ThumbsDown className="h-3 w-3" />
-              </button>
-            </div>
-          )}
-          {!readOnly && (
-            <button
-              onClick={() => onConfirm(item.id, true)}
-              className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-1.5 text-[11px] font-black text-emerald-700 transition-colors hover:bg-emerald-100"
-            >
-              <CheckCircle2 className="h-3.5 w-3.5" /> 单独确认
-            </button>
+            <>
+              {/* 有利/不利切换（只读模式只展示当前状态，不可切换） */}
+              {readOnly ? (
+                <span
+                  className={cn(
+                    "inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[11px] font-black",
+                    item.useful === true
+                      ? "bg-emerald-500 text-white"
+                      : item.useful === false
+                      ? "bg-rose-500 text-white"
+                      : "bg-secondary text-muted-foreground",
+                  )}
+                >
+                  {item.useful === true ? <ThumbsUp className="h-3 w-3" /> : <ThumbsDown className="h-3 w-3" />}
+                </span>
+              ) : (
+                <div className="flex overflow-hidden rounded-full border border-border">
+                  <button
+                    onClick={() => onSetUseful(item.id, true)}
+                    className={cn(
+                      "px-3 py-1.5 text-[11px] font-black transition-colors",
+                      item.useful === true ? "bg-emerald-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
+                    )}
+                  >
+                    <ThumbsUp className="h-3 w-3" />
+                  </button>
+                  <button
+                    onClick={() => onSetUseful(item.id, false)}
+                    className={cn(
+                      "px-3 py-1.5 text-[11px] font-black transition-colors",
+                      item.useful === false ? "bg-rose-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
+                    )}
+                  >
+                    <ThumbsDown className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
+              {!readOnly && (
+                <button
+                  onClick={() => onConfirm(item.id, true)}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-1.5 text-[11px] font-black text-emerald-700 transition-colors hover:bg-emerald-100"
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" /> 单独确认
+                </button>
+              )}
+              {!readOnly && (
+                <button
+                  onClick={() => onConfirm(item.id, false)}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-rose-300 bg-rose-50 px-3 py-1.5 text-[11px] font-black text-rose-700 transition-colors hover:bg-rose-100"
+                  title="标记为排除：不采用、不进入归档"
+                >
+                  <XCircle className="h-3.5 w-3.5" /> 排除
+                </button>
+              )}
+            </>
           )}
           <button
             onClick={() => setExpandedId(expanded ? null : item.id)}
@@ -581,7 +621,7 @@ function ImageRow({
             </details>
             <div className="grid grid-cols-2 gap-2">
               <DetailRow label="证明力等级" text={levelLabel(item.evidence_level)} />
-              <DetailRow label="对己方" text={item.useful === true ? "有利" : item.useful === false ? "不利" : "待定"} />
+              <DetailRow label="对己方" text={item.confirmed === false ? "已排除" : item.useful === true ? "有利" : item.useful === false ? "不利" : "待定"} />
             </div>
           </div>
         </motion.div>
@@ -622,13 +662,14 @@ function MediaSection({
 function MediaRow({
   item, onConfirm, onSetUseful, readOnly = false,
 }: {
-  item: EvidenceItem; onConfirm: (id: string, status: boolean) => void;
+  item: EvidenceItem; onConfirm: (id: string, status: boolean | null) => void;
   onSetUseful: (id: string, u: Useful) => void;
   readOnly?: boolean;
 }) {
   const isVideo = item.type === "video";
+  const excluded = item.confirmed === false; // 已排除：既非有利也非不利，不进归档，只展示"已排除"一个状态
   return (
-    <div className="p-5">
+    <div className={cn("p-5 transition-opacity", excluded && "opacity-60")}>
       <div className="flex flex-wrap items-center gap-4">
         <div className={cn(
           "flex h-16 w-20 shrink-0 items-center justify-center rounded-xl border text-muted-foreground",
@@ -640,11 +681,19 @@ function MediaRow({
           <div className="flex flex-wrap items-center gap-2">
             <span className="truncate text-sm font-black text-foreground">{item.name}</span>
             <EvidenceLevelBadge level={item.evidence_level} />
-            <UsefulBadge useful={item.useful} />
-            {item.confirmed === true && (
-              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[9px] font-black text-emerald-700">
-                <CheckCircle2 className="h-3 w-3" /> 已确认
+            {excluded ? (
+              <span className="inline-flex items-center gap-1 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-[9px] font-black text-rose-700">
+                <XCircle className="h-3 w-3" /> 已排除
               </span>
+            ) : (
+              <>
+                <UsefulBadge useful={item.useful} />
+                {item.confirmed === true && (
+                  <span className="inline-flex items-center gap-1 rounded-full border border-emerald-200 bg-emerald-50 px-2 py-0.5 text-[9px] font-black text-emerald-700">
+                    <CheckCircle2 className="h-3 w-3" /> 已确认
+                  </span>
+                )}
+              </>
             )}
           </div>
           {item.file_url && (
@@ -690,47 +739,67 @@ function MediaRow({
           </div>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          {readOnly ? (
-            <span
-              className={cn(
-                "inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[11px] font-black",
-                item.useful === true
-                  ? "bg-emerald-500 text-white"
-                  : item.useful === false
-                  ? "bg-rose-500 text-white"
-                  : "bg-secondary text-muted-foreground",
-              )}
-            >
-              {item.useful === true ? <ThumbsUp className="h-3 w-3" /> : <ThumbsDown className="h-3 w-3" />}
-            </span>
+          {excluded ? (
+            !readOnly && (
+              <button
+                onClick={() => onConfirm(item.id, null)}
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-4 py-1.5 text-[11px] font-black text-muted-foreground transition-colors hover:bg-accent"
+              >
+                <RotateCcw className="h-3.5 w-3.5" /> 取消排除
+              </button>
+            )
           ) : (
             <>
-              <div className="flex overflow-hidden rounded-full border border-border">
-                <button
-                  onClick={() => onSetUseful(item.id, true)}
+              {readOnly ? (
+                <span
                   className={cn(
-                    "px-3 py-1.5 text-[11px] font-black transition-colors",
-                    item.useful === true ? "bg-emerald-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
+                    "inline-flex items-center gap-1 rounded-full px-3 py-1.5 text-[11px] font-black",
+                    item.useful === true
+                      ? "bg-emerald-500 text-white"
+                      : item.useful === false
+                      ? "bg-rose-500 text-white"
+                      : "bg-secondary text-muted-foreground",
                   )}
                 >
-                  <ThumbsUp className="h-3 w-3" />
-                </button>
-                <button
-                  onClick={() => onSetUseful(item.id, false)}
-                  className={cn(
-                    "px-3 py-1.5 text-[11px] font-black transition-colors",
-                    item.useful === false ? "bg-rose-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
-                  )}
-                >
-                  <ThumbsDown className="h-3 w-3" />
-                </button>
-              </div>
-              <button
-                onClick={() => onConfirm(item.id, true)}
-                className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-1.5 text-[11px] font-black text-emerald-700 transition-colors hover:bg-emerald-100"
-              >
-                <CheckCircle2 className="h-3.5 w-3.5" /> 单独确认
-              </button>
+                  {item.useful === true ? <ThumbsUp className="h-3 w-3" /> : <ThumbsDown className="h-3 w-3" />}
+                </span>
+              ) : (
+                <>
+                  <div className="flex overflow-hidden rounded-full border border-border">
+                    <button
+                      onClick={() => onSetUseful(item.id, true)}
+                      className={cn(
+                        "px-3 py-1.5 text-[11px] font-black transition-colors",
+                        item.useful === true ? "bg-emerald-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
+                      )}
+                    >
+                      <ThumbsUp className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => onSetUseful(item.id, false)}
+                      className={cn(
+                        "px-3 py-1.5 text-[11px] font-black transition-colors",
+                        item.useful === false ? "bg-rose-500 text-white" : "bg-card text-muted-foreground hover:bg-accent",
+                      )}
+                    >
+                      <ThumbsDown className="h-3 w-3" />
+                    </button>
+                  </div>
+                  <button
+                    onClick={() => onConfirm(item.id, true)}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300 bg-emerald-50 px-4 py-1.5 text-[11px] font-black text-emerald-700 transition-colors hover:bg-emerald-100"
+                  >
+                    <CheckCircle2 className="h-3.5 w-3.5" /> 单独确认
+                  </button>
+                  <button
+                    onClick={() => onConfirm(item.id, false)}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-rose-300 bg-rose-50 px-3 py-1.5 text-[11px] font-black text-rose-700 transition-colors hover:bg-rose-100"
+                    title="标记为排除：不采用、不进入归档"
+                  >
+                    <XCircle className="h-3.5 w-3.5" /> 排除
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>
