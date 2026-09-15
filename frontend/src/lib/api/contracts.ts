@@ -2,7 +2,7 @@
  * Contracts API - 合同相关接口
  */
 
-import { get, post, put, del, getAccessToken } from './client';
+import { get, post, put, del, getAccessToken, API_BASE_URL, API_PREFIX } from './client';
 
 /**
  * 合同列表查询参数
@@ -213,8 +213,9 @@ export async function archiveContract(id: number, reason?: string): Promise<any>
  * 导出真正的 .docx（后端 python-docx 生成，避免 HTML 伪 .doc 乱码）
  */
 export async function downloadContractDocx(title: string, content: string): Promise<{ blob: Blob; filename: string }> {
-  const prefix = import.meta.env.VITE_API_PREFIX || "/api";
-  const base = import.meta.env.VITE_API_URL || "";
+  // 统一走 client.ts 的 base/prefix，避免同一份配置两处解析后漂移
+  const prefix = API_PREFIX;
+  const base = API_BASE_URL;
   const token = getAccessToken();
   const res = await fetch(`${base}${prefix}/contracts/export-docx`, {
     method: "POST",
@@ -239,8 +240,9 @@ export async function downloadContractDocx(title: string, content: string): Prom
  * 导出真正的 PDF（后端 reportlab 生成，A4 中文排版，直接下载而非打印）
  */
 export async function downloadContractPdf(title: string, content: string): Promise<{ blob: Blob; filename: string }> {
-  const prefix = import.meta.env.VITE_API_PREFIX || "/api";
-  const base = import.meta.env.VITE_API_URL || "";
+  // 统一走 client.ts 的 base/prefix，避免同一份配置两处解析后漂移
+  const prefix = API_PREFIX;
+  const base = API_BASE_URL;
   const token = getAccessToken();
   const res = await fetch(`${base}${prefix}/contracts/export-pdf`, {
     method: "POST",

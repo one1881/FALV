@@ -35,6 +35,7 @@ from app.services.agent_core import (
     AgentCore,
     build_chat_model,
     build_root_chat_model,
+    ensure_mcp_servers_registered,
     list_skill_documents,
     list_mcp_servers,
     list_mcp_tools,
@@ -42,6 +43,36 @@ from app.services.agent_core import (
 )
 
 settings = get_settings()
+
+# 进程内回退前要求的最小剩余预算（秒）：低于此值就不再重跑——
+# A2A 超时并不意味着 :8001 已停止，它很可能还在跑；此时盲目回退会把同一份
+# 起草跑两遍，耗时与费用直接翻倍（2026-09-11 实测"一次任务 4 个 drafting 线程"的主因）。
+_MIN_FALLBACK_BUDGET_SECONDS = 150.0
+
+# 根代理层同一 (thread, 任务类型) 允许真实派发子代理的最大次数。
+# 根代理是 ReAct 循环：一旦它认为派发结果不理想（或工具抛错），会自己再调一次
+# 同一个派发工具——这是「一次任务里 drafting 子代理被调用 4 次」的真正触发器
+# （子代理内部的 _MAX_DELIVERABLE_ATTEMPTS 管不到根代理层）。
+# 超过此上限后直接失败，不再重复消耗；成功过的派发一律复用首次交付物。
+_MAX_ROOT_DISPATCH_ATTEMPTS = 2
+
+
+def _task_label(task_type: str) -> str:
+    """任务类型的中文标签，用于日志与用户可见的报错文案。"""
+    return {"drafting": "起草", "review": "审核"}.get(task_type or "", "任务")
+
+
+def _total_budget_seconds(task_type: str) -> float:
+    """按任务类型返回端到端预算（秒）。
+
+    2026-09-11 修复：此前 execute() 与 _remaining_budget() 一律读
+    DRAFTING_TOTAL_BUDGET_SECONDS，对审核也套用起草的 360s。审核是穷尽式扫描
+    + 4 个 skill，且允许重生成一次（最坏 2 倍耗时）——实测 3751 字文档单次 205s，
+    首轮不合格即 410s > 360s，会被误掐且报错文案写成「起草」。
+    """
+    if (task_type or "") == "review":
+        return float(getattr(settings, "REVIEW_TOTAL_BUDGET_SECONDS", 1500.0) or 1500.0)
+    return float(getattr(settings, "DRAFTING_TOTAL_BUDGET_SECONDS", 360.0) or 360.0)
 
 
 @dataclass
@@ -73,6 +104,17 @@ class DeepAgentsService(AgentCore):
         # A2A 派发所需：thread_id -> 当前请求 / 子代理产物
         self._active_requests: Dict[str, Dict[str, Any]] = {}
         self._a2a_results: Dict[str, Dict[str, Any]] = {}
+        # thread_id -> 任务开始时刻：回退重跑前据此判断剩余预算，防止双跑
+        self._task_started: Dict[str, float] = {}
+        # thread_id -> 任务类型：预算按起草/审核分别取（见 _total_budget_seconds）
+        self._task_types: Dict[str, str] = {}
+        # 根代理层派活幂等（key = f"{thread_id}:{kind}"）：
+        # _dispatch_done     已成功的派发结果，重复调用直接复用（不再打子代理）
+        # _dispatch_attempts 已真实派发次数，达到 _MAX_ROOT_DISPATCH_ATTEMPTS 即拒绝
+        # _dispatch_locks    同一 key 串行化，防并发重复派发
+        self._dispatch_done: Dict[str, str] = {}
+        self._dispatch_attempts: Dict[str, int] = {}
+        self._dispatch_locks: Dict[str, asyncio.Lock] = {}
         self._a2a_client = A2AClient()
         self._agent = self._build_agent()
 
@@ -104,6 +146,9 @@ class DeepAgentsService(AgentCore):
         )
 
     def _build_root_tools(self) -> list[Any]:
+        # 与 agent_core.build_tools 保持一致：本进程若未经过 app.main（如 CLI/探针），
+        # MCP 会未注册，根代理的 list_mcp_servers 会返回空（2026-09-11 修复）。
+        ensure_mcp_servers_registered()
         return [
             list_skill_documents,
             list_mcp_servers,
@@ -138,14 +183,18 @@ class DeepAgentsService(AgentCore):
         """
         service = self
 
-        async def _dispatch() -> str:
-            thread_id = ""
+        def _current_thread_id() -> str:
+            """取当前 LangGraph 线程号；取不到时返回空串，由调用方兜底。"""
             try:
                 from langchain_core.runnables import ensure_config
+
                 cfg = ensure_config() or {}
-                thread_id = str((cfg.get("configurable") or {}).get("thread_id") or "")
-            except Exception:
-                thread_id = ""
+                return str((cfg.get("configurable") or {}).get("thread_id") or "")
+            except Exception:  # noqa: BLE001
+                return ""
+
+        async def _dispatch_uncached(thread_id: str) -> str:
+            """真正发起一次 A2A 派发；不含幂等判断，仅由 _dispatch 调用。"""
             request = service._active_requests.get(thread_id)
             if request is None and service._active_requests:
                 # 兜底：ensure_config 偶发取不到 thread_id 时，取最近暂存的请求，
@@ -180,13 +229,17 @@ class DeepAgentsService(AgentCore):
                 # 子代理已真实执行并失败（多为模型/上游错误，如 Arrearage）——
                 # 进程内重跑大概率同样失败，直接抛出，避免双倍耗时/费用
                 raise
-            except A2AError as exc:
-                # 2) 回退：A2A 服务不可达（连不上/超时/协议错）时，进程内执行同一套子代理逻辑
-                result = await run_sub_agent_task(kind, request, transport="in-process")
-                result.setdefault("execution_trace", [])
-                result["a2a_fallback_error"] = str(exc)
-                transport = "in-process"
-            except Exception as exc:  # 网络库等异常同样回退
+            except Exception as exc:  # noqa: BLE001 — 网络/协议/超时统一走回退判断
+                # 2) 回退：A2A 服务不可达（连不上/超时/协议错）时，进程内执行同一套子代理逻辑。
+                # 但必须先看预算：A2A 超时 ≠ :8001 已停止，它很可能还在跑同一份活；
+                # 此时再在本地跑一遍 = 双跑，耗时与费用翻倍（实测 21 分钟的主因）。
+                remaining = service._remaining_budget(thread_id)
+                if remaining is not None and remaining < _MIN_FALLBACK_BUDGET_SECONDS:
+                    raise A2AError(
+                        "A2A 未在预算内返回"
+                        f"（{type(exc).__name__}: {exc}），剩余预算仅 {remaining:.0f}s，"
+                        f"不足以在进程内重跑一次{_task_label(kind)}；已放弃回退以避免双倍耗时。"
+                    ) from exc
                 result = await run_sub_agent_task(kind, request, transport="in-process")
                 result.setdefault("execution_trace", [])
                 result["a2a_fallback_error"] = f"{type(exc).__name__}: {exc}"
@@ -196,6 +249,46 @@ class DeepAgentsService(AgentCore):
             if thread_id:
                 service._a2a_results[thread_id] = result
             return json.dumps(result, ensure_ascii=False, default=str)
+
+        async def _dispatch() -> str:
+            """幂等派发：同一 (thread, 任务类型) 只真正调用一次子代理。
+
+            根代理是 ReAct 循环，只要它认为派发结果不理想（或工具抛错），就会自己
+            再调一次同一个工具——这是「一次任务里 drafting 子代理被调用 4 次」的触发器。
+            三层护栏：
+              1) 已成功过 → 直接复用首次交付物，不再打子代理（治「重复成功」）
+              2) 真实派发次数达上限 → 抛错停止，不再消耗（治「反复失败重试」）
+              3) 同 key 加锁串行 → 防并发下的重复派发
+            """
+            thread_id = _current_thread_id()
+            key = f"{thread_id or '__anon__'}:{kind}"
+            lock = service._dispatch_locks.get(key)
+            if lock is None:
+                lock = asyncio.Lock()
+                service._dispatch_locks[key] = lock
+
+            async with lock:
+                cached = service._dispatch_done.get(key)
+                if cached is not None:
+                    logger.warning(
+                        "[deepagents] 拦截重复派活 key=%s：复用首次交付物，"
+                        "不再重复调用子代理（本任务已真实执行 %d 次）",
+                        key,
+                        service._dispatch_attempts.get(key, 0),
+                    )
+                    return cached
+
+                attempts = service._dispatch_attempts.get(key, 0)
+                if attempts >= _MAX_ROOT_DISPATCH_ATTEMPTS:
+                    raise A2AError(
+                        f"同一{_task_label(kind)}任务已派发 {attempts} 次仍未成功，"
+                        "已停止重试以避免重复消耗（双跑）。"
+                    )
+
+                service._dispatch_attempts[key] = attempts + 1
+                result_json = await _dispatch_uncached(thread_id)
+                service._dispatch_done[key] = result_json
+                return result_json
 
         async def _dispatch_tool() -> str:
             """派发任务给 A2A 子代理并原样返回其 JSON 交付物。"""
@@ -255,11 +348,19 @@ class DeepAgentsService(AgentCore):
         self._a2a_results.pop(task_key, None)
 
         orchestrator_start = time.perf_counter()
+        self._task_started[task_key] = orchestrator_start
+        _task_type = request.get("task_type", "")
+        self._task_types[task_key] = _task_type
+        budget = _total_budget_seconds(_task_type)
         try:
             prompt = self._build_prompt(request, as_root=True)
-            raw_result = await self._agent.ainvoke(
-                {"messages": [{"role": "user", "content": prompt}]},
-                config={"configurable": {"thread_id": task_key}},
+            # 总预算看门狗：不论链路内部如何超时/重试/回退，用户等待不超过 budget 秒
+            raw_result = await asyncio.wait_for(
+                self._agent.ainvoke(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config={"configurable": {"thread_id": task_key}},
+                ),
+                timeout=budget,
             )
             orchestrator_elapsed = time.perf_counter() - orchestrator_start
             task.timings["orchestrator"] = round(orchestrator_elapsed, 3)
@@ -309,6 +410,32 @@ class DeepAgentsService(AgentCore):
             })
             task.updated_at = datetime.now().isoformat()
             return task.to_dict()
+        except asyncio.TimeoutError:
+            elapsed = time.perf_counter() - orchestrator_start
+            label = _task_label(_task_type)
+            logger.error(
+                "[deepagents] %s超出总预算 task=%s 已用 %.1fs（预算 %.0fs）",
+                label, task_key, elapsed, budget,
+            )
+            task.status = "failed"
+            if _task_type == "review":
+                task.error = (
+                    f"审核超过 {budget:.0f} 秒预算已中止（已用 {elapsed:.0f}s）。"
+                    "建议拆分为多个章节分别送审，或缩短待审文档。"
+                )
+            else:
+                task.error = (
+                    f"起草超过 {budget:.0f} 秒预算已中止（已用 {elapsed:.0f}s）。"
+                    "建议精简需求描述，或拆分为多份合同分别生成。"
+                )
+            task.events.append({
+                "type": "event",
+                "message": f"{label}超出 {budget:.0f} 秒预算，已中止",
+                "level": "error",
+                "timestamp": datetime.now().isoformat(),
+            })
+            task.updated_at = datetime.now().isoformat()
+            return task.to_dict()
         except Exception as exc:
             logger.exception("[deepagents] 任务执行失败 task=%s", task_key)
             task.status = "failed"
@@ -325,6 +452,21 @@ class DeepAgentsService(AgentCore):
         finally:
             self._active_requests.pop(task_key, None)
             self._a2a_results.pop(task_key, None)
+            self._task_started.pop(task_key, None)
+            self._task_types.pop(task_key, None)
+            # 派活幂等状态随任务生命周期释放（key 形如 f"{task_key}:{kind}"）
+            prefix = f"{task_key}:"
+            for store in (self._dispatch_done, self._dispatch_attempts, self._dispatch_locks):
+                for stale_key in [k for k in store if k.startswith(prefix)]:
+                    store.pop(stale_key, None)
+
+    def _remaining_budget(self, thread_id: str) -> float | None:
+        """返回当前任务剩余的预算秒数（按起草/审核分别取）；无记录时返回 None。"""
+        started = self._task_started.get(thread_id)
+        if started is None:
+            return None
+        budget = _total_budget_seconds(self._task_types.get(thread_id, ""))
+        return budget - (time.perf_counter() - started)
 
     def get_task(self, task_key: str) -> Dict[str, Any] | None:
         task = self._tasks.get(task_key)

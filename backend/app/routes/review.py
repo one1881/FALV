@@ -3,12 +3,14 @@ from typing import Optional
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.models.user import User
 from app.schemas.agent import AgentExecuteRequest
+from app.services.ai_service import get_ai_service
 from app.services.deepagents_service import get_deepagents_service
 from app.services.review_service import ReviewService
 
@@ -208,3 +210,34 @@ def list_review_records(
     """历史审查记录：默认返回最近 limit 条；传 contract_id 则只看某合同的历史。"""
     records = ReviewService(db).list_records(limit=max(1, min(limit, 100)), contract_id=contract_id)
     return {"status": "success", "total": len(records), "records": [ReviewService.to_dict(r) for r in records]}
+
+
+@router.post("/apply-suggestion")
+async def apply_suggestion(payload: dict, current_user: User = Depends(get_current_user)):  # noqa: ARG001
+    """一键修改：把某条审核建议真正应用到对应段落，返回 LLM 改写后的段落文本。
+
+    AIService 是同步客户端，必须经线程池调用（工程红线：async 路由禁止直调同步 SDK）。
+    """
+    paragraph = str(payload.get("paragraph") or "").strip()
+    issue = payload.get("issue") or {}
+    description = str(issue.get("description") or "").strip()
+    suggestion = str(issue.get("suggestion") or "").strip()
+    legal_basis = str(issue.get("legal_basis") or "").strip()
+    if not paragraph:
+        raise HTTPException(status_code=422, detail="缺少待修改的段落原文")
+    if not suggestion and not description:
+        raise HTTPException(status_code=422, detail="缺少修改建议/问题描述，无法改写")
+
+    call = await run_in_threadpool(
+        get_ai_service().apply_clause_revision,
+        paragraph,
+        description,
+        suggestion,
+        legal_basis,
+    )
+    if not call.get("ok"):
+        raise HTTPException(status_code=502, detail=f"AI 改写失败：{call.get('error', '未知错误')}")
+    return {
+        "revised": call.get("revised", ""),
+        "unchanged": call.get("unchanged", False),
+    }

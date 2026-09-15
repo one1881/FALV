@@ -19,7 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { PageHeader } from "../components/PageHeader";
-import { type ReviewDocumentResponse, type ReviewIssue } from "../../lib/api/review";
+import { type ReviewDocumentResponse, type ReviewIssue, applySuggestion } from "../../lib/api/review";
 import { createContractFromContent, submitContractApproval } from "../../lib/api/contracts";
 
 const SEVERITY_OPTIONS = [
@@ -41,6 +41,7 @@ export function ContractReview() {
   const [content, setContent] = useState("");
   const [resolved, setResolved] = useState<Set<string>>(new Set());
   const [expandedIssue, setExpandedIssue] = useState<Set<string>>(new Set());
+  const [applying, setApplying] = useState<Set<string>>(new Set());
   const [submitting, setSubmitting] = useState(false);
   const [submittedInfo, setSubmittedInfo] = useState<{ id: number; workflowId?: string } | null>(null);
   const [submitError, setSubmitError] = useState("");
@@ -155,14 +156,139 @@ export function ContractReview() {
 
   const paragraphs = content.split(/\n+/).map((p) => p.trim()).filter(Boolean);
 
-  const matchIssue = (issue: ReviewIssue, text: string, paraIndex: number) => {
+  // ---- 条款号关联（纯规则，不调 LLM）----
+  // 背景：审核契约里 clause 是自由文本（如 "第一条与第二条"、"第二条2.2与第三条3.2"、"合同首部/签署栏"），
+  // 旧实现 text.includes(clause) 整串子串匹配必然失败，导致所有建议掉进"未关联"区。
+  const CN_DIGITS: Record<string, number> = { 零: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
+
+  const cnToInt = (s: string): number => {
+    if (/^\d+$/.test(s)) return parseInt(s, 10);
+    const str = s.replace(/零/g, "");
+    if (!str) return NaN;
+    if (str === "十") return 10;
+    const tenIdx = str.indexOf("十");
+    if (tenIdx >= 0) {
+      const tens = tenIdx === 0 ? 1 : CN_DIGITS[str.slice(0, tenIdx)];
+      const ones = tenIdx === str.length - 1 ? 0 : CN_DIGITS[str.slice(tenIdx + 1)];
+      if (tens === undefined || ones === undefined) return NaN;
+      return tens * 10 + ones;
+    }
+    let n = 0;
+    for (const ch of str) {
+      const d = CN_DIGITS[ch];
+      if (d === undefined) return NaN;
+      n = n * 10 + d;
+    }
+    return n;
+  };
+
+  interface ClauseRefs { ints: number[]; decs: string[]; anchors: string[] }
+
+  const parseClauseRefs = (clause: string): ClauseRefs => {
+    if (/^\d+$/.test(clause)) return { ints: [parseInt(clause, 10)], decs: [], anchors: [] };
+    const ints: number[] = [];
+    const decs: string[] = [];
+    const anchors: string[] = [];
+    // 第X条 / 第X款（中文数字或阿拉伯数字，含 第3.1条）
+    const artRe = /第\s*([0-9一二三四五六七八九十百零]+(?:\.[0-9]+)?)\s*[条款]/g;
+    let m: RegExpExecArray | null;
+    while ((m = artRe.exec(clause))) {
+      const raw = m[1];
+      if (raw.includes(".")) decs.push(raw);
+      else {
+        const n = cnToInt(raw);
+        if (!Number.isNaN(n)) ints.push(n);
+      }
+    }
+    // 独立小数引用，如 "2.2"
+    const decRe = /(^|[^0-9.])(\d+\.\d+)(?![0-9])/g;
+    while ((m = decRe.exec(clause))) decs.push(m[2]);
+    if (/签署|签栏|签字|盖章|落款/.test(clause)) anchors.push("sign");
+    if (/首部|标题|抬头/.test(clause)) anchors.push("head");
+    return { ints: [...new Set(ints)], decs: [...new Set(decs)], anchors };
+  };
+
+  // 每段所属条款号：以段落开头的条款标记为准（容许 Markdown ## 前缀），续段继承上一条；
+  // 签署块（盖章/签字/签署日期等）截断继承，避免尾部落款被并入最后一个条款
+  const paraArticles: (number | null)[] = (() => {
+    const arr: (number | null)[] = [];
+    let cur: number | null = null;
+    paragraphs.forEach((p) => {
+      if (p.length <= 60 && /签字|签章|盖章|签署日期|落款/.test(p)) {
+        cur = null;
+        arr.push(cur);
+        return;
+      }
+      let s = p.match(/^\s*#{0,4}\s*第\s*([0-9一二三四五六七八九十百零]+)\s*条/);
+      if (s) {
+        const n = cnToInt(s[1]);
+        if (!Number.isNaN(n)) cur = n;
+      } else if ((s = p.match(/^\s*(\d+\.\d+)/))) {
+        cur = parseInt(s[1], 10);
+      } else if ((s = p.match(/^\s*([0-9一二三四五六七八九十]+)\s*[、.．，,]/))) {
+        const n = cnToInt(s[1]);
+        if (!Number.isNaN(n)) cur = n;
+      }
+      arr.push(cur);
+    });
+    return arr;
+  })();
+
+  const matchPara = (issue: ReviewIssue, text: string, paraIndex: number): boolean => {
     const clause = (issue.clause || "").trim();
     if (!clause) return false;
-    if (/^\d+$/.test(clause)) return Number(clause) === paraIndex + 1;
+    const refs = parseClauseRefs(clause);
+    // 锚点：签署栏 / 合同首部
+    if (refs.anchors.includes("sign") && (/签署|签字|盖章|落款/.test(text) || paraIndex >= paragraphs.length - 2)) return true;
+    if (refs.anchors.includes("head") && paraIndex === 0) return true;
+    // 只认"条款起始段"（第X条 / 2.2 / 3、开头）：续段、表格行不作为候选，避免一条建议挂满全篇
+    const start = text.match(/^\s*#{0,4}\s*第\s*([0-9一二三四五六七八九十百零]+)\s*条/);
+    if (start) {
+      const n = cnToInt(start[1]);
+      if (!Number.isNaN(n) && refs.ints.includes(n)) return true;
+    }
+    const startDec = text.match(/^\s*(\d+\.\d+)/)?.[1];
+    if (startDec && refs.decs.includes(startDec)) return true;
+    // 兜底：原子串匹配
     return text.includes(clause) || clause.includes(text.slice(0, 10));
   };
-  const issuesOfParagraph = (text: string, paraIndex: number) =>
-    issues.filter((it) => matchIssue(it, text, paraIndex));
+
+  // 与建议描述的相似度：数字 token 重合权重高，二字词面重合权重低
+  const tokenSet = (s: string) => new Set((s.match(/\d+(?:\.\d+)?/g) || []).map((t) => t.replace(/,/g, "")));
+  const bigramSet = (s: string) => {
+    const t = s.replace(/\s+/g, "");
+    const set = new Set<string>();
+    for (let i = 0; i < t.length - 1; i++) set.add(t.slice(i, i + 2));
+    return set;
+  };
+
+  // v2：一条建议只锚定"最相关的一段"。多候选（跨条款矛盾类）时按描述与段落的
+  // 数字/词面重合度打分选唯一主锚点——旧版把建议复制到所有同条款段落，
+  // 造成大面积重复、改完一处其他处仍在。
+  const primaryParaOfIssue = (issue: ReviewIssue): number => {
+    const cands: number[] = [];
+    paragraphs.forEach((p, i) => {
+      if (matchPara(issue, p, i)) cands.push(i);
+    });
+    if (cands.length === 0) return -1;
+    if (cands.length === 1) return cands[0];
+    const desc = `${issue.description || ""}${issue.suggestion || ""}`;
+    const dTokens = tokenSet(desc);
+    const dBigrams = bigramSet(desc);
+    let best = cands[0];
+    let bestScore = -1;
+    for (const i of cands) {
+      const p = paragraphs[i];
+      let s = 0;
+      tokenSet(p).forEach((t) => { if (dTokens.has(t)) s += 10; });
+      bigramSet(p).forEach((b) => { if (dBigrams.has(b)) s += 1; });
+      if (s > bestScore) { bestScore = s; best = i; }
+    }
+    return best;
+  };
+  const issuePrimary = issues.map((it) => primaryParaOfIssue(it));
+  const issuesOfParagraph = (_text: string, paraIndex: number) =>
+    issues.filter((_it, gi) => issuePrimary[gi] === paraIndex);
 
   const toggleResolved = (key: string) => {
     setResolved((prev) => {
@@ -180,6 +306,37 @@ export function ContractReview() {
       else next.add(key);
       return next;
     });
+  };
+
+  // 一键修改：真正把审核建议应用到段落（LLM 改写 → 替换正文 → 标记已完成）。
+  // 改写失败时退化为仅标记，避免阻塞用户手动编辑。
+  const applyFix = async (issue: ReviewIssue, pIdx: number, key: string) => {
+    if (applying.has(key)) return;
+    setApplying((prev) => new Set(prev).add(key));
+    try {
+      const resp = await applySuggestion({
+        paragraph: paragraphs[pIdx],
+        issue: {
+          description: issue.description || "",
+          suggestion: issue.suggestion || "",
+          legal_basis: issue.legal_basis || "",
+        },
+      });
+      if (resp?.revised && !resp.unchanged) {
+        const newParas = paragraphs.slice();
+        newParas[pIdx] = resp.revised;
+        setContent(newParas.join("\n"));
+      }
+    } catch {
+      /* 退化为仅标记 */
+    } finally {
+      setApplying((prev) => {
+        const n = new Set(prev);
+        n.delete(key);
+        return n;
+      });
+      setResolved((prev) => new Set(prev).add(key));
+    }
   };
 
   return (
@@ -329,8 +486,20 @@ export function ContractReview() {
                                 </span>
                               ) : (
                                 <>
-                                  <button onClick={() => toggleResolved(key)} className="ml-auto inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-3 py-1 text-[10px] font-black text-emerald-700 transition-colors hover:bg-emerald-100">
-                                    <CheckCircle className="h-3 w-3" /> 一键修改
+                                  <button
+                                    onClick={() => void applyFix(issue, pIdx, key)}
+                                    disabled={applying.has(key)}
+                                    className="ml-auto inline-flex items-center gap-1 rounded-full border border-emerald-300 bg-emerald-50 px-3 py-1 text-[10px] font-black text-emerald-700 transition-colors hover:bg-emerald-100 disabled:opacity-50"
+                                  >
+                                    {applying.has(key) ? (
+                                      <>
+                                        <Loader2 className="h-3 w-3 animate-spin" /> AI 改写中…
+                                      </>
+                                    ) : (
+                                      <>
+                                        <CheckCircle className="h-3 w-3" /> 一键修改
+                                      </>
+                                    )}
                                   </button>
                                   <button onClick={() => toggleExpand(key)} className="inline-flex items-center gap-1 rounded-full border border-border bg-card px-3 py-1 text-[10px] font-black text-muted-foreground transition-colors hover:bg-accent">
                                     <ChevronUp className="h-3 w-3" /> 收起

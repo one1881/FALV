@@ -27,6 +27,11 @@ __pycache__/
 .venv/
 venv/
 
+# ===== 误创建的路径残留 =====
+# Windows 下 `> /dev/null` 会被部分工具（cmd/PowerShell/node）解析成相对路径，
+# 在项目里生成 dev/null 文件（2026-09-12 已清理 frontend/dev/null 并加此规则防复发）。
+**/dev/null
+
 # ===== 模型权重与大文件 =====
 backend/models/
 yolo-video-service/*.mp4
@@ -40,3 +45,12 @@ backend/runtime/
 backend/large_tool_results/
 .DS_Store
 Thumbs.db
+
+# ===== 测试脚本与诊断输出 =====
+backend/_*.txt
+backend/_*.json
+backend/_*.bat
+backend/scripts/_*.py
+frontend/scripts/
+frontend/tmp/
+optimization_plan.md

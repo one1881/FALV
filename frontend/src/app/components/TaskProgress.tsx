@@ -16,6 +16,7 @@ export function TaskProgress({
   phases,
   phaseIndex,
   startedAt,
+  estimatedTotalSeconds,
   className,
 }: {
   title?: string;
@@ -25,6 +26,15 @@ export function TaskProgress({
   phaseIndex?: number;
   /** 任务开始时间（Date.now()），用于计算已用时长与剩余预估 */
   startedAt?: number;
+  /**
+   * 阶段模式的预估总时长（秒），缺省按每阶段 60 秒推算。
+   *
+   * 2026-09-11 修复：此前阶段模式写死「每阶段 60 秒」，4 阶段 = 240 秒封顶。
+   * 审核实测 205~410 秒，导致进度条在 240 秒就走满 100%，ETA 被 Math.max 钳在
+   * 「10 秒」后继续挂两三分钟——看起来像卡死。现改为对外可传真实预估，
+   * 且进度封顶 95%（任务未结束就不显示 100%），超预估时如实改文案。
+   */
+  estimatedTotalSeconds?: number;
   className?: string;
 }) {
   const [now, setNow] = useState(Date.now());
@@ -40,30 +50,44 @@ export function TaskProgress({
   // 多文件模式
   const isMulti = typeof current === "number" && typeof total === "number" && total > 0;
 
-  // 阶段模式：外部传入 phaseIndex 则用之；否则按已用时长自动推进（每阶段约 60 秒）
-  const autoPhaseIndex = phases && phases.length > 0 && typeof phaseIndex !== "number" ? Math.min(phases.length - 1, Math.floor(elapsed / 60)) : undefined;
+  const hasPhases = !!(phases && phases.length > 0);
+  // 阶段模式预估总时长：调用方可传，缺省每阶段 60 秒
+  const estimatedTotal =
+    estimatedTotalSeconds && estimatedTotalSeconds > 0
+      ? estimatedTotalSeconds
+      : hasPhases
+        ? phases!.length * 60
+        : 90;
+  const secondsPerPhase = hasPhases ? Math.max(15, Math.round(estimatedTotal / phases!.length)) : 60;
+
+  // 阶段模式：外部传入 phaseIndex 则用之；否则按已用时长自动推进
+  const autoPhaseIndex =
+    hasPhases && typeof phaseIndex !== "number"
+      ? Math.min(phases!.length - 1, Math.floor(elapsed / secondsPerPhase))
+      : undefined;
   const activePhaseIndex = typeof phaseIndex === "number" ? phaseIndex : (autoPhaseIndex ?? 0);
   const percent = isMulti
     ? Math.min(100, Math.round((current! / total!) * 100))
-    : phases && phases.length > 0
-      ? Math.min(100, Math.round(((activePhaseIndex + 1) / phases.length) * 100))
+    : hasPhases
+      ? // 封顶 95%：任务还在跑就不能显示「已完成」
+        Math.min(95, Math.round(((activePhaseIndex + 1) / phases!.length) * 100))
       : 0;
 
-  // 剩余预估：多文件按平均耗时外推；阶段模式按总时长推算
-  let eta = "";
+  // 剩余预估
+  let etaText = "";
+  const overdue = elapsed > estimatedTotal;
   if (isMulti && current! > 0) {
     const perItem = elapsed / current!;
-    const remain = Math.ceil(perItem * (total! - current!));
-    eta = formatSec(remain);
-  } else if (phases && phases.length > 0) {
-    const totalEst = phases.length * 60; // 每阶段约 1 分钟
-    const remain = Math.max(10, totalEst - elapsed);
-    eta = formatSec(remain);
+    etaText = `预计剩余 ${formatSec(Math.ceil(perItem * (total! - current!)))}`;
+  } else if (hasPhases) {
+    etaText = overdue
+      ? `仍在处理（已用 ${formatSec(elapsed)}）`
+      : `预计剩余 ${formatSec(Math.max(5, estimatedTotal - elapsed))}`;
   } else {
-    eta = formatSec(Math.max(30, 90 - elapsed));
+    etaText = `预计剩余 ${formatSec(Math.max(30, 90 - elapsed))}`;
   }
 
-  const phaseLabel = phases && phases.length > 0 ? phases[activePhaseIndex] : "";
+  const phaseLabel = hasPhases ? phases![activePhaseIndex] : "";
 
   return (
     <div className={cn("rounded-2xl border border-border bg-card/90 px-5 py-4 shadow-sm", className)}>
@@ -75,9 +99,7 @@ export function TaskProgress({
         </div>
         <div className="flex items-center gap-2 text-[11px] font-black text-muted-foreground">
           {isMulti && <span>已完成 {current} / {total}</span>}
-          <span className="rounded-full bg-secondary px-2.5 py-0.5">
-            {eta ? `预计剩余 ${eta}` : "正在计算…"}
-          </span>
+          <span className="rounded-full bg-secondary px-2.5 py-0.5">{etaText || "正在计算…"}</span>
         </div>
       </div>
 

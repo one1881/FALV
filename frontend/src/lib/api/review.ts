@@ -52,6 +52,14 @@ export async function reviewDocument(data: ReviewDocumentRequest): Promise<Revie
   return post<ReviewDocumentResponse>('/api/review/review-document', data);
 }
 
+/** 一键修改：按审核建议改写单个段落，返回改写后的文本 */
+export async function applySuggestion(payload: {
+  paragraph: string;
+  issue: Pick<ReviewIssue, 'description' | 'suggestion' | 'legal_basis'>;
+}): Promise<{ revised: string; unchanged?: boolean }> {
+  return post<{ revised: string; unchanged?: boolean }>('/api/review/apply-suggestion', payload);
+}
+
 /** 审核任务快照（轮询返回） */
 export interface ReviewTaskSnapshot {
   task_id: string;

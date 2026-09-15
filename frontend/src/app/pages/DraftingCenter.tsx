@@ -434,6 +434,10 @@ export function DraftingCenter() {
         throw new Error("合同生成超时（10 分钟），请联系管理员");
       };
       const response = await poll();
+      // 防御：后端未回填 contract_id（如落库失败）时不再跳 /editor/undefined（会请求 /api/contracts/NaN）
+      if (!response?.contract_id) {
+        throw new Error("合同已生成，但归档失败（未返回合同 ID）。请到「合同管理」查看，或重新生成一次。");
+      }
       navigate(`/drafting/editor/${response.contract_id}?type=${encodeURIComponent(selectedType.key)}`);
     } catch (err: any) {
       setError(err?.message || "生成失败，请稍后重试");
@@ -499,6 +503,10 @@ export function DraftingCenter() {
         throw new Error("合同生成超时（10 分钟），请联系管理员");
       };
       const response = await poll();
+      // 防御：后端未回填 contract_id（如落库失败）时不再跳 /editor/undefined（会请求 /api/contracts/NaN）
+      if (!response?.contract_id) {
+        throw new Error("合同已生成，但归档失败（未返回合同 ID）。请到「合同管理」查看，或重新生成一次。");
+      }
       navigate(`/drafting/editor/${response.contract_id}?type=${encodeURIComponent(selectedType.key)}`);
     } catch (err: any) {
       setError(err?.message || "生成失败，请稍后重试");

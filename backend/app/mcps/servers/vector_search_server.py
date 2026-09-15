@@ -6,6 +6,7 @@ MCP 工具:
 """
 from __future__ import annotations
 from typing import Dict, Any, Optional, List
+from pathlib import Path
 import re
 import logging
 import hashlib
@@ -20,11 +21,25 @@ from app.core.config import settings
 from app.models.contract import Contract
 
 logger = logging.getLogger(__name__)
-_BGE_MODEL = None
-_BGE_LOAD_ATTEMPTED = False
+
+# backend/ 根目录。BGE_MODEL_PATH 默认配的是相对路径（./models/...），
+# 相对路径依赖启动时的 CWD —— 从别的目录启动后端会静默降级成哈希向量。
+# 这里统一按 backend/ 解析，把「相对路径依赖 CWD」这个坑堵死（2026-09-12）。
+BACKEND_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _resolve_bge_path(raw: str) -> str:
+    """把 BGE_MODEL_PATH 解析为绝对路径（相对路径按 backend/ 解析）。"""
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = BACKEND_ROOT / path
+    return str(path)
 
 # 合同向量缓存：{contract_id: (content_signature, vector)}，内容未变时复用，避免每次检索重复 encode
 _CONTRACT_VECTOR_CACHE: Dict[int, tuple] = {}
+
+_BGE_MODEL = None
+_BGE_LOAD_ATTEMPTED = False
 
 
 # 简化版 embedding:文本前 128 个汉字做 token 频率统计 + Jaccard
@@ -48,12 +63,18 @@ def _embedding(text: str, dim: int = 128) -> Dict[str, float]:
     global _BGE_MODEL, _BGE_LOAD_ATTEMPTED
     if settings.BGE_MODEL_PATH and not _BGE_LOAD_ATTEMPTED:
         _BGE_LOAD_ATTEMPTED = True
+        model_path = _resolve_bge_path(settings.BGE_MODEL_PATH)
         try:
             from sentence_transformers import SentenceTransformer
-            _BGE_MODEL = SentenceTransformer(settings.BGE_MODEL_PATH)
-            logger.info("Loaded local BGE model: %s", settings.BGE_MODEL_PATH)
+            _BGE_MODEL = SentenceTransformer(model_path)
+            logger.info("Loaded local BGE model: %s", model_path)
         except Exception as exc:
-            logger.warning("BGE model unavailable, using hash fallback: %s", exc)
+            # 故意用 error 级别：降级到哈希向量会静默拉低相似检索质量，
+            # 不能再只打一行 warning 让它长期潜伏（2026-09-11 BGE 静默降级事件）。
+            logger.error(
+                "BGE 加载失败，相似检索将退化为哈希向量（质量下降）。path=%s, reason=%s: %s",
+                model_path, type(exc).__name__, exc,
+            )
 
     if _BGE_MODEL is not None:
         values = _BGE_MODEL.encode(

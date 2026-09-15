@@ -305,14 +305,76 @@ async def generate_contract(
 async def generate_contract_async(
     request: ContractGenerateRequest,
     current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
-    """异步提交合同生成任务：立即返回 task_key，前端轮询进度。
+    """异步提交合同生成任务：根据复杂度选择快速服务或 deepagents。
 
-    起草是分钟级 A2A 链路（主控决策 + 子代理生成），同步等待容易被浏览器/代理
-    掐断报"请求超时"，改为提交后轮询，前端还能展示实时进度。
+    - 简单任务（有模板、无复杂需求）：快速服务，60秒完成
+    - 复杂任务（大量附件、特殊条款）：deepagents 框架，5-10分钟
     """
-    service = get_deepagents_service()
+    from app.core.config import get_settings
+    from app.mcps.servers.template_server import TEMPLATE_LIBRARY
+
+    settings = get_settings()
     task_key = f"drafting:{request.contract_type}:{current_user.id}:{uuid.uuid4().hex[:8]}"
+
+    # 判断任务复杂度（仅在快速路径开关打开时才影响走向）
+    # 注：jurisdiction 的 schema 默认是 None 且前端不传，必须先归一到 "中国" 再比对，
+    # 否则 `None not in [...]` 恒为 True，所有请求都会被判成复杂任务。
+    has_template = request.contract_type in TEMPLATE_LIBRARY
+    is_complex = (
+        len(request.materials or []) > 5 or  # 上传了很多附件
+        (request.requirements and len(request.requirements) > 500) or  # 需求很复杂
+        (request.jurisdiction or "中国") not in ["中国", "北京", "上海", "广东", "深圳"]  # 非常见管辖
+    )
+
+    # 简单任务：使用快速服务
+    # 【已回退 2026-09-11】FAST_DRAFTING_ENABLED 默认 False：该分支尚有 3 处阻断缺陷
+    # （落库少传 user_id / 返回契约与前端轮询不符 / 客户端缺代理绝缘），
+    # 修好前一律走下方 deepagents 主链路。详见《合同起草快路径_诊断报告_20260911.md》。
+    if settings.FAST_DRAFTING_ENABLED and has_template and not is_complex:
+        from app.services.fast_drafting_service import get_fast_drafting_service
+
+        try:
+            fast_service = get_fast_drafting_service()
+            result = await fast_service.draft_contract(
+                contract_type=request.contract_type,
+                customer_name=request.customer_name or "客户",
+                amount=float(request.amount) if request.amount else 0,
+                requirements=request.requirements or "",
+                industry=request.industry or "通用",
+                jurisdiction=request.jurisdiction or "中国",
+                materials_text=request.materials_text or "",
+            )
+
+            # 立即落库（快速服务已完成生成）
+            contract = ContractService(db).create_contract(
+                ContractCreate(
+                    title=f"{request.contract_type} - {request.customer_name or '客户'}",
+                    contract_type=request.contract_type,
+                    customer_name=request.customer_name,
+                    content=result["content"],
+                    amount=request.amount,
+                    status="草稿",
+                    created_by=current_user.id,
+                )
+            )
+
+            return {
+                "task_key": task_key,
+                "status": "completed",
+                "contract_id": contract.id,
+                "generation_time": result["generation_time"],
+                "method": "fast",
+                "message": f"合同生成完成（快速模式，耗时 {result['generation_time']}秒）",
+            }
+
+        except Exception as e:
+            logger.error(f"快速起草失败，回退到 deepagents: {e}")
+            # 快速服务失败，回退到 deepagents
+
+    # 复杂任务 或 快速服务失败：使用 deepagents 框架
+    service = get_deepagents_service()
     input_data = {
         "party_id": request.party_id,
         "customer_name": request.customer_name,
@@ -337,6 +399,8 @@ async def generate_contract_async(
         "task_key": task_key,
         "status": snapshot.get("status", "running"),
         "poll_url": f"/api/contracts/tasks/{task_key}",
+        "method": "deepagents",
+        "message": "复杂任务，使用 deepagents 框架处理（预计 3-5 分钟）",
     }
 
 
@@ -366,7 +430,7 @@ async def get_contract_task(
                 # 用独立会话落库，避免与主循环事务冲突
                 db_session = SessionLocal()
                 try:
-                    generation_result = result.get("result", {})
+                    generation_result = result.get("result") if isinstance(result.get("result"), dict) else result
                     content_block = generation_result.get("content", {}) if isinstance(generation_result, dict) else {}
                     generated_content = content_block.get("content") if isinstance(content_block, dict) else generation_result.get("content", "")
                     generated_content = (generated_content or "").strip() if isinstance(generated_content, str) else str(generated_content or "").strip()

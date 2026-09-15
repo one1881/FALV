@@ -3,9 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
-import httpx
-
 from app.core.config import settings
+from app.core.net import new_proxy_immune_async_client
 from app.mcps.base_server import BaseMCPServer
 
 
@@ -35,7 +34,8 @@ class YoloServer(BaseMCPServer):
                     "frame_interval_seconds": str(interval),
                     "model_path": settings.YOLO_MODEL_PATH,
                 }
-                async with httpx.AsyncClient(timeout=600) as client:
+                # trust_env=False（见 app/core/net.py）：防代理注入把抽帧识别请求绕死
+                async with new_proxy_immune_async_client(600) as client:
                     response = await client.post(settings.YOLO_API_URL, data=data, files=files)
             response.raise_for_status()
             payload = response.json()

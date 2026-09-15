@@ -8,6 +8,7 @@ from typing import Any, Dict
 import httpx
 
 from app.core.config import settings
+from app.core.net import new_proxy_immune_async_client
 from app.mcps.base_server import BaseMCPServer
 
 
@@ -43,7 +44,8 @@ class ASRServer(BaseMCPServer):
             audio_path = await self._prepare_audio(path)
             auth = {"Authorization": f"Bearer {api_key}"}
 
-            async with httpx.AsyncClient(timeout=180) as client:
+            # trust_env=False（见 app/core/net.py）：防代理注入把语音转写请求绕死
+            async with new_proxy_immune_async_client(180) as client:
                 # 1. 获取上传凭证
                 policy_resp = await client.get(
                     f"{base}/uploads",

@@ -158,7 +158,15 @@ async function request<T>(
     // 处理响应
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
-      throw new Error(errorData.detail || errorData.message || `HTTP ${response.status}`);
+      const detail = errorData.detail ?? errorData.message;
+      // detail 可能是对象/数组（如 FastAPI 422 校验错误），直接塞进 Error 会变成 "[object Object]"
+      const msg =
+        typeof detail === "string" && detail
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : `HTTP ${response.status}`;
+      throw new Error(msg);
     }
 
     // 解析响应
@@ -259,4 +267,4 @@ export async function uploadMany<T>(
 /**
  * 导出工具函数
  */
-export { saveTokens, clearTokens, getAccessToken, API_BASE_URL };
+export { saveTokens, clearTokens, getAccessToken, API_BASE_URL, API_PREFIX };

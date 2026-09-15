@@ -8,6 +8,18 @@
 """
 from __future__ import annotations
 
+import sys
+import os
+
+# Windows 上强制使用 UTF-8 编码，避免 GBK 解码错误
+if sys.platform == "win32":
+    os.environ["PYTHONUTF8"] = "1"
+    # 重新配置标准输入输出编码
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+
 import uvicorn
 
 from app.a2a.server import build_a2a_app

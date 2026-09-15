@@ -6,7 +6,7 @@
  * 文书 .md 单件导出与材料包 .zip 整包导出。
  */
 
-import { get, post } from './client';
+import { get, post, API_BASE_URL, API_PREFIX } from './client';
 
 /* ------------------------------------------------------------------ */
 /* 类型定义                                                             */
@@ -247,7 +247,7 @@ export function downloadCaseDoc(caseId: string, doc: string, fallbackName: strin
 /** 下载证据目录/其他文书为 PDF（reportlab 渲染，支持中文） */
 export async function downloadCaseDocPdf(caseId: string, doc: string, fallbackName: string) {
   const token = localStorage.getItem("access_token");
-  const res = await fetch(`${import.meta.env.VITE_API_URL || ""}${import.meta.env.VITE_API_PREFIX || "/api"}/litigation/cases/${caseId}/exports/${doc}.pdf`, {
+  const res = await fetch(`${API_BASE_URL}${API_PREFIX}/litigation/cases/${caseId}/exports/${doc}.pdf`, {
     headers: token ? { Authorization: `Bearer ${token}` } : {},
   });
   if (!res.ok) {

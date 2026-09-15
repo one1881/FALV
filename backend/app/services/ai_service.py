@@ -114,6 +114,43 @@ class AIService:
         logger.error(f"{purpose} 调用失败: {last_error}")
         return {"ok": False, "error": last_error}
 
+    def apply_clause_revision(
+        self,
+        paragraph: str,
+        description: str,
+        suggestion: str,
+        legal_basis: str = "",
+    ) -> dict:
+        """按审核建议改写单个合同条款段落（同步实现，async 链路须走线程池调用）。
+
+        Returns:
+            {"ok": True, "revised": 改写后段落} 或 {"ok": False, "error": str}
+        """
+        system = (
+            "你是资深合同起草律师。任务：根据审核意见，改写给定的合同条款段落。"
+            "硬约束：1) 只做与审核意见直接相关的最小必要修改，其余文字原样保留；"
+            "2) 保留原段落的条款编号与格式；3) 修改不得引入新的事实（金额、数量、日期等"
+            "若审核意见给出选项，选择更符合律师惯例的一种并直接写入）；"
+            "4) 原文可能含 Markdown 标记（## 标题、**加粗**、|表格行|），必须原样保留这些"
+            "标记与表格结构，不得增删星号或井号；"
+            "5) 若审核意见是跨条款矛盾，只修改本段落一侧的表述，不要重述另一条款的内容；"
+            '6) 只输出 JSON：{"revised": "改写后的完整段落"}。'
+        )
+        user = (
+            f"【合同条款段落】\n{paragraph}\n\n"
+            f"【问题描述】\n{description}\n\n"
+            f"【法律依据】\n{legal_basis or '无'}\n\n"
+            f"【修改建议】\n{suggestion}\n"
+        )
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        call = self._json_chat(messages, max_tokens=2000, purpose="合同条款一键修改")
+        if not call.get("ok"):
+            return call
+        revised = str(call.get("data", {}).get("revised") or "").strip()
+        if not revised:
+            return {"ok": False, "error": "模型未返回改写后的段落"}
+        return {"ok": True, "revised": revised, "unchanged": revised == paragraph.strip()}
+
     def describe_image(self, image_base64: str, prompt: str = "", mime: str = "image/jpeg") -> dict:
         """用 Qwen-VL 理解一张图片/视频帧的画面内容。
 
@@ -259,408 +296,6 @@ class AIService:
                 time.sleep(1)
         return {"ok": False, "error": last_error}
 
-    def analyze_contract_risk(self, contract_content: str) -> dict:
-        """分析合同风险点
-
-        Args:
-            contract_content: 合同内容文本
-
-        Returns:
-            包含风险分析结果的字典
-        """
-        try:
-            prompt = f"""作为一名专业的法律顾问，请分析以下合同内容，识别潜在的法律风险点。
-
-合同内容：
-{contract_content}
-
-请按以下格式输出分析结果：
-1. 高风险点（如果有）
-2. 中风险点（如果有）
-3. 低风险点（如果有）
-4. 整体风险评级（低/中/高）
-5. 建议改进措施
-
-请用简洁清晰的语言，突出重点。"""
-
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": "你是一位专业的法律顾问，擅长合同风险分析。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=2000
-            )
-
-            analysis_text = response.choices[0].message.content
-
-            return {
-                "success": True,
-                "analysis": analysis_text,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"合同风险分析失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def extract_contract_clauses(self, contract_content: str) -> dict:
-        """提取合同关键条款
-
-        Args:
-            contract_content: 合同内容文本
-
-        Returns:
-            包含提取结果的字典
-        """
-        try:
-            prompt = f"""请从以下合同内容中提取关键条款信息：
-
-合同内容：
-{contract_content}
-
-请提取以下信息（如果存在）：
-1. 合同双方（甲方、乙方）
-2. 合同标的
-3. 合同金额
-4. 履行期限
-5. 付款方式
-6. 违约责任
-7. 争议解决方式
-8. 其他重要条款
-
-请用结构化的方式列出，每条信息单独一行。如果某项信息不存在，注明"未提及"。"""
-
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": "你是一位专业的法律文书分析助手，擅长提取合同关键信息。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.1,
-                max_tokens=1500
-            )
-
-            extraction_text = response.choices[0].message.content
-
-            return {
-                "success": True,
-                "clauses": extraction_text,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"条款提取失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def generate_contract_summary(self, contract_content: str) -> dict:
-        """生成合同摘要
-
-        Args:
-            contract_content: 合同内容文本
-
-        Returns:
-            包含摘要的字典
-        """
-        try:
-            prompt = f"""请为以下合同生成一份简洁的摘要（200字以内）：
-
-合同内容：
-{contract_content}
-
-摘要应包括：
-- 合同类型
-- 合同双方
-- 主要内容
-- 关键条款
-- 金额和期限（如果有）"""
-
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": "你是一位专业的法律文书助手。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=500
-            )
-
-            summary_text = response.choices[0].message.content
-
-            return {
-                "success": True,
-                "summary": summary_text,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"摘要生成失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def chat_about_contract(self, contract_content: str, question: str, chat_history: list = None) -> dict:
-        """与AI助手对话咨询合同问题
-
-        Args:
-            contract_content: 合同内容文本
-            question: 用户的问题
-            chat_history: 对话历史 [{"role": "user", "content": "..."}, {"role": "assistant", "content": "..."}]
-
-        Returns:
-            包含回答的字典
-        """
-        try:
-            messages = [
-                {"role": "system", "content": "你是一位专业的法律顾问，正在帮助用户理解和分析合同内容。请基于提供的合同内容回答用户的问题。"},
-                {"role": "user", "content": f"这是需要分析的合同内容：\n{contract_content}"}
-            ]
-
-            # 添加对话历史
-            if chat_history:
-                messages.extend(chat_history)
-
-            # 添加当前问题
-            messages.append({"role": "user", "content": question})
-
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=1500
-            )
-
-            answer = response.choices[0].message.content
-
-            return {
-                "success": True,
-                "answer": answer,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"AI对话失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    async def generate_contract_content(self, prompt: str) -> dict:
-        """生成合同内容
-
-        Args:
-            prompt: 合同生成提示词
-
-        Returns:
-            包含生成内容的字典
-        """
-        try:
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": "你是一位专业的法律合同起草专家，擅长起草各类商业合同。"},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                max_tokens=3000
-            )
-
-            content = (response.choices[0].message.content or "").strip()
-            if not content:
-                return {
-                    "success": False,
-                    "error": "DeepSeek 返回了空合同正文",
-                }
-
-            return {
-                "success": True,
-                "content": content,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"合同生成失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
-
-    def extract_evidence_fields(
-        self,
-        material_text: str,
-        file_name: str = "",
-        file_type: str = "",
-    ) -> dict:
-        """用 LLM 从证据原文里抽取结构化字段。
-
-        输入：OCR/ASR/抽帧后的文本片段 + 文件名 + 文件类型
-        输出（严格 JSON）：
-          evidence_name     正式证据名称（按法院习惯改写）
-          evidence_type     书证/言词证据/鉴定意见/视听资料/物证照片/电子数据
-          proof_purpose     本证据要证明的事实（1-2 句法庭话术）
-          three_natures     {真实性, 合法性, 关联性} 各一句
-          risk_notes        对方可能质证的点
-          supplement_advice 我方需要补强什么
-          group_hint        第一组主体资格 / 第二组法律关系 / 第三组履行 / 第四组违约 / 第五组金额 / 第六组沟通 / 第七组其他
-          confidence        0~1，LLM 自我评估抽取可信度
-        失败时返回 {"success": False, "error": "..."}，调用方应降级到模板关键词逻辑。
-        """
-        try:
-            snippet = (material_text or "")[:1800]
-            system_prompt = (
-                "你是一名执业律师助理，擅长把诉讼证据材料整理成可向法院提交的证据目录。"
-                "你必须只输出合法 JSON，不要任何解释、不要 Markdown 代码块。"
-            )
-            user_prompt = (
-                "请阅读下面这份证据材料，提取结构化字段并严格按 JSON 格式输出。\n"
-                f"文件名：{file_name}\n"
-                f"文件类型：{file_type}\n"
-                "证据原文：\n"
-                f"{snippet}\n\n"
-                "输出 JSON 结构：\n"
-                '{"evidence_name": "正式证据名称（按法院提交习惯）",\n'
-                ' "evidence_type": "书证/言词证据/鉴定意见/视听资料/物证照片/电子数据 之一",\n'
-                ' "proof_purpose": "1-2 句法庭话术，说明本证据要证明的事实",\n'
-                ' "three_natures": {"真实性": "一句", "合法性": "一句", "关联性": "一句"},\n'
-                ' "risk_notes": ["对方质证点1", "质证点2"],\n'
-                ' "supplement_advice": ["补强建议1"],\n'
-                ' "group_hint": "第一组主体资格/第二组法律关系成立/第三组履行/第四组违约/第五组金额损失/第六组沟通催告/第七组其他辅助 之一",\n'
-                ' "confidence": 0.85}'
-            )
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-                max_tokens=900,
-                response_format={"type": "json_object"},
-            )
-            content = (response.choices[0].message.content or "").strip()
-            if not content:
-                return {"success": False, "error": "DeepSeek 返回了空 JSON"}
-            import json
-            try:
-                parsed = json.loads(content)
-            except Exception as e:
-                return {"success": False, "error": f"JSON 解析失败: {e}; raw={content[:200]}"}
-            return {
-                "success": True,
-                "evidence_name": parsed.get("evidence_name") or "",
-                "evidence_type": parsed.get("evidence_type") or "",
-                "proof_purpose": parsed.get("proof_purpose") or "",
-                "three_natures": parsed.get("three_natures") or {},
-                "risk_notes": parsed.get("risk_notes") or [],
-                "supplement_advice": parsed.get("supplement_advice") or [],
-                "group_hint": parsed.get("group_hint") or "",
-                "confidence": float(parsed.get("confidence") or 0),
-                "source": "primary_llm.extract_evidence_fields",
-            }
-        except Exception as e:
-            logger.error(f"证据字段抽取失败: {str(e)}")
-            return {"success": False, "error": str(e)}
-
-    def summarize_material(
-        self,
-        material_text: str,
-        file_name: str = "",
-        file_type: str = "",
-    ) -> dict:
-        """用 LLM 对一份材料生成「重点摘要 + 证据价值评估」。
-
-        输出（严格 JSON）：
-          summary        一句话说明这份材料证明/记录了什么
-          key_facts      关键事实 {字段: 值}（金额/日期/主体/承诺等）
-          evidence_value 高 / 中 / 低（对案件的证明价值）
-          needs_confirm  是否需要律师人工确认（金额/主体/日期不确定时为 true）
-          risk_flags     风险提示列表
-        失败返回 {"success": False, "error": "..."}，调用方降级为规则兜底。
-        """
-        import json
-        try:
-            snippet = (material_text or "")[:2000]
-            system_prompt = (
-                "你是一名执业律师助理，负责快速判断一份诉讼证据材料的证明价值和重点。"
-                "你必须只输出合法 JSON，不要任何解释、不要 Markdown 代码块。"
-            )
-            user_prompt = (
-                "请阅读下面这份材料，给出重点摘要和证据价值评估，严格按 JSON 输出。\n"
-                f"材料名：{file_name}\n"
-                f"材料类型：{file_type}\n"
-                "材料内容：\n"
-                f"{snippet}\n\n"
-                "输出 JSON 结构：\n"
-                '{"summary": "一句话说明这份材料证明或记录了什么",\n'
-                ' "key_facts": {"关键字段": "值", "金额": "...", "日期": "...", "主体": "..."},\n'
-                ' "evidence_value": "高/中/低 之一",\n'
-                ' "needs_confirm": true 或 false,\n'
-                ' "risk_flags": ["风险提示1"]}'
-            )
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
-                temperature=0.2,
-                max_tokens=600,
-                response_format={"type": "json_object"},
-            )
-            content = (response.choices[0].message.content or "").strip()
-            if not content:
-                return {"success": False, "error": "DeepSeek 返回了空 JSON"}
-            try:
-                parsed = json.loads(content)
-            except Exception as e:
-                return {"success": False, "error": f"JSON 解析失败: {e}"}
-            value_map = {"高": "high", "中": "medium", "低": "low"}
-            return {
-                "success": True,
-                "summary": parsed.get("summary") or "",
-                "key_facts": parsed.get("key_facts") or {},
-                "evidence_value": value_map.get(parsed.get("evidence_value"), "medium"),
-                "needs_confirm": bool(parsed.get("needs_confirm", True)),
-                "risk_flags": parsed.get("risk_flags") or [],
-                "source": "primary_llm.summarize_material",
-            }
-        except Exception as e:
-            logger.error(f"材料摘要评估失败: {str(e)}")
-            return {"success": False, "error": str(e)}
-
     def assess_case_acceptance(self, case_info: dict, materials_summary: str = "") -> dict:
         """用 LLM 对案件做「受理分析」：受理建议、风险、缺失材料、案由、管辖、策略。
 
@@ -737,117 +372,19 @@ class AIService:
             logger.error(f"受理分析 LLM 调用失败: {str(e)}")
             return {"success": False, "error": str(e)}
 
-    def analyze_case_strategy(self, case_info: dict, materials_summary: str = "", evidence_summary: str = "") -> dict:
-        """用 LLM 做诉讼策略分析：案由、管辖、构成要件、举证责任、争议焦点、诉讼策略。
 
-        Returns:
-            {"success": True, "cause": {...}, "jurisdiction": {...}, "element_proof": [...],
-             "dispute_focus": [...], "strategy_summary": ..., "litigation_path": [...]}
-            失败返回 {"success": False, "error": "..."}
-        """
-        import json
-        import time
-        import hashlib
-        from app.services.cache_service import get_cache
-        cache_key = "strategy:" + hashlib.md5(
-            (json.dumps(case_info, ensure_ascii=False, sort_keys=True) + "|" + (materials_summary or "") + "|" + (evidence_summary or "")).encode("utf-8")
-        ).hexdigest()
-        cached = get_cache().get(cache_key)
-        if isinstance(cached, dict) and cached.get("success"):
-            return {**cached, "source": "cache"}
-        try:
-            claims = case_info.get("claims") or []
-            claims_text = "\n".join(f"- {c}" for c in claims) or "（未填写）"
-            user_prompt = (
-                "你是一名资深诉讼律师，请对下面这个案件做一次完整的诉讼策略分析，"
-                "严格只输出合法 JSON，不要任何解释、不要 Markdown 代码块。\n\n"
-                "【案件信息】\n"
-                f"客户/原告：{case_info.get('customer_name') or '未提供'}\n"
-                f"对方/被告：{case_info.get('opposite_party') or '未提供'}\n"
-                f"被告住所地：{case_info.get('defendant_address') or (case_info.get('defendant') or {}).get('address') or '未提供'}\n"
-                f"争议金额：{case_info.get('dispute_amount') or '未提供'}\n"
-                f"案情摘要：{case_info.get('case_summary') or '未提供'}\n"
-                f"诉讼请求：\n{claims_text}\n\n"
-                "【已确认证据材料摘要】\n"
-                f"{materials_summary or '（暂无）'}\n\n"
-                "【证据目录/时间线摘要】\n"
-                f"{evidence_summary or '（暂无）'}\n\n"
-                "请输出如下 JSON 结构（字段名必须完全一致）：\n"
-                "{\n"
-                ' "cause": {"name": "推荐案由", "code": "案由代码", "legal_basis": "法律依据"},\n'
-                ' "jurisdiction": {"primary_court": "建议管辖法院", "legal_basis": "管辖依据", "reasoning": "理由"},\n'
-                ' "element_proof": [{"element": "构成要件", "proof_target": "证明目标", "evidence_focus": "关注证据"}],\n'
-                ' "dispute_focus": ["争议焦点1", "争议焦点2"],\n'
-                ' "strategy_summary": "一句话诉讼策略",\n'
-                ' "litigation_path": [{"stage": "阶段", "action": "动作"}],\n'
-                ' "next_steps": ["下一步1", "下一步2"]\n'
-                "}\n"
-                "注意：案由、管辖要结合案情和被告住所地给出专业判断；信息不足时给出合理专业推断。"
-            )
-            messages = [
-                {"role": "system", "content": "你是资深诉讼律师，负责诉讼策略分析，只输出 JSON。"},
-                {"role": "user", "content": user_prompt},
-            ]
-            call = self._json_chat(messages, max_tokens=4000, purpose="诉讼策略分析")
-            if not call.get("ok"):
-                return {"success": False, "error": call.get("error")}
-            parsed = call["data"]
-            result = {
-                "success": True,
-                "cause": parsed.get("cause") or {},
-                "jurisdiction": parsed.get("jurisdiction") or {},
-                "element_proof": parsed.get("element_proof") or [],
-                "dispute_focus": parsed.get("dispute_focus") or [],
-                "strategy_summary": parsed.get("strategy_summary") or "",
-                "litigation_path": parsed.get("litigation_path") or [],
-                "next_steps": parsed.get("next_steps") or [],
-                "source": "primary_llm.analyze_case_strategy",
-            }
-            get_cache().set(cache_key, result, ttl=3600)
-            return result
-        except Exception as e:
-            logger.error(f"诉讼策略分析 LLM 调用失败: {str(e)}")
-            return {"success": False, "error": str(e)}
+# ---------------------------------------------------------------------------
+# 进程级单例（2026-09-12）
+# ---------------------------------------------------------------------------
+# AIService.__init__ 会创建 1 个 httpx.Client + 最多 2 个 OpenAI 客户端（各带连接池）。
+# 证据链路里有 4 处 `AIService()` 即时实例化 —— 每次调用重建三套客户端，连接池完全不复用，
+# 高频调用下还会堆积 TIME_WAIT 连接。统一走 get_ai_service()。
+_AI_SERVICE: "AIService | None" = None
 
-    async def chat(self, prompt: str, chat_history: list = None) -> dict:
-        """通用AI对话
 
-        Args:
-            prompt: 提示词
-            chat_history: 对话历史
-
-        Returns:
-            包含回答的字典
-        """
-        try:
-            messages = []
-            if chat_history:
-                messages.extend(chat_history)
-            messages.append({"role": "user", "content": prompt})
-
-            response = self.client.chat.completions.create(
-                model=settings.primary_llm_model,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=2000
-            )
-
-            answer = response.choices[0].message.content
-
-            return {
-                "success": True,
-                "answer": answer,
-                "model": settings.primary_llm_model,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                }
-            }
-
-        except Exception as e:
-            logger.error(f"AI对话失败: {str(e)}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+def get_ai_service() -> AIService:
+    """获取 AIService 进程级单例。"""
+    global _AI_SERVICE
+    if _AI_SERVICE is None:
+        _AI_SERVICE = AIService()
+    return _AI_SERVICE

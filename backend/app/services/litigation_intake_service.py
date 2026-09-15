@@ -289,9 +289,9 @@ class LitigationIntakeService:
         return signature.startswith("000") or signature.endswith("000")
 
     async def _classify_image(self, path: Path, file_name: str, mime: str) -> Dict[str, Any]:
-        from app.services.ai_service import AIService
+        from app.services.ai_service import get_ai_service
 
-        ai = AIService()
+        ai = get_ai_service()
         image_bytes = path.read_bytes()
         image_b64 = base64.b64encode(image_bytes).decode("utf-8")
         prompt = (
@@ -568,11 +568,11 @@ class LitigationIntakeService:
         import logging
 
         logger = logging.getLogger(__name__)
-        from app.services.ai_service import AIService
+        from app.services.ai_service import get_ai_service
         from app.mcps.servers.asr_server import ASRServer
         from app.mcps.servers.qwen_server import QwenServer
 
-        ai = AIService()
+        ai = get_ai_service()
         asr_server = ASRServer()
         qwen = QwenServer()
         analyzed = []
@@ -742,14 +742,14 @@ class LitigationIntakeService:
         import logging
 
         logger = logging.getLogger(__name__)
-        from app.services.ai_service import AIService
+        from app.services.ai_service import get_ai_service
         from app.mcps.servers.asr_server import ASRServer
         from app.mcps.servers.qwen_server import QwenServer
 
         if material.analysis_status in {"analyzed", "pending_confirm", "confirmed", "rejected"}:
             return {"material_id": material.material_id, "file_name": material.file_name, "status": "skipped"}
 
-        ai = AIService()
+        ai = get_ai_service()
         asr_server = ASRServer()
         qwen = QwenServer()
         path = Path(material.file_path)
@@ -1207,10 +1207,10 @@ class LitigationIntakeService:
 
     def assess_acceptance(self, intake: LitigationIntake, case_info: Dict[str, Any]) -> Dict[str, Any]:
         """受理后分析：基于已确认材料摘要 + 案件信息，用 DeepSeek 生成专业结论。"""
-        from app.services.ai_service import AIService
+        from app.services.ai_service import get_ai_service
         case_info = self._merge_intake_case_info(intake, case_info)
         materials_summary = self._build_materials_summary(intake)
-        ai = AIService()
+        ai = get_ai_service()
         result = ai.assess_case_acceptance(case_info, materials_summary)
         if result.get("success"):
             return result

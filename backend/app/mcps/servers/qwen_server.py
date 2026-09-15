@@ -3,9 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any, Dict
 
-import httpx
-
 from app.core.config import settings
+from app.core.net import new_proxy_immune_async_client
 from app.mcps.base_server import BaseMCPServer
 
 
@@ -46,7 +45,8 @@ class QwenServer(BaseMCPServer):
                 "temperature": 0.1,
             }
             headers = {"Authorization": f"Bearer {settings.QWEN_API_KEY}", "Content-Type": "application/json"} if settings.QWEN_API_KEY else {"Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=120) as client:
+            # trust_env=False（见 app/core/net.py）：防代理注入把证据抽取请求绕死
+            async with new_proxy_immune_async_client(120) as client:
                 response = await client.post(self._chat_url(), headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
@@ -78,7 +78,8 @@ class QwenServer(BaseMCPServer):
                 "temperature": 0.1,
             }
             headers = {"Authorization": f"Bearer {settings.QWEN_API_KEY}", "Content-Type": "application/json"} if settings.QWEN_API_KEY else {"Content-Type": "application/json"}
-            async with httpx.AsyncClient(timeout=120) as client:
+            # trust_env=False（见 app/core/net.py）：防代理注入把证据抽取请求绕死
+            async with new_proxy_immune_async_client(120) as client:
                 response = await client.post(self._chat_url(), headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()

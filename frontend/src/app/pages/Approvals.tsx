@@ -118,8 +118,9 @@ export function Approvals() {
     setReviewStartedAt(Date.now());
     setError("");
     try {
-      // 审核是分钟级 agent 循环（实测 4-8 分钟）：同步等待会被浏览器/代理
-      // 掐断报"请求超时"，改为异步提交 + 轮询进度
+      // 审核是分钟级 agent 循环（2026-09-11 实测：1186 字约 145s、3751 字约 205s，
+      // 端到端含根代理约 193s；旧值「4-8 分钟」是 thinking_budget 修复前的数据）。
+      // 同步等待会被浏览器/代理掐断报"请求超时"，故异步提交 + 轮询进度。
       const { task_key } = await startReviewDocumentAsync({
         document_type: "contract",
         contract_id: contractId ?? undefined,
@@ -258,6 +259,10 @@ export function Approvals() {
             title="AI 审核合同"
             phases={["解析合同文本", "逐条分析条款", "识别风险点", "生成审核报告"]}
             startedAt={reviewStartedAt}
+            // 审核耗时随文档长度近似线性（2026-09-11 实测：1186 字 145s、3751 字 205s，
+            // 斜率约 0.0234 s/字、截距约 117s），乘 1.15 留余量。不传则组件按
+            // 「每阶段 60 秒」估算，会让进度条提前跑满、ETA 假报（见 TaskProgress 注释）。
+            estimatedTotalSeconds={Math.round((117 + 0.0234 * content.trim().length) * 1.15)}
             className="mt-4"
           />
         )}

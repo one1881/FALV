@@ -52,6 +52,8 @@ def _yolo_python_exe() -> str:
 def _yolo_env() -> dict:
     """复用 start_service.bat 的逻辑：把 backend/.env 注入子进程环境变量。"""
     env = os.environ.copy()
+    # Windows 上强制使用 UTF-8 编码，避免 GBK 解码错误
+    env["PYTHONUTF8"] = "1"
     try:
         for line in YOLO_ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()

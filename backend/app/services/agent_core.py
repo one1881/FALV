@@ -30,7 +30,13 @@ from langchain_openai import ChatOpenAI
 
 from app.core.config import get_settings
 from app.core.checkpoint import build_checkpointer
+from app.core.net import MODEL_CONNECT_TIMEOUT, proxy_immune_clients
 from app.mcps.clients import get_mcp_client
+
+try:  # Markdown → HTML：起草正文的 HTML 改由代码生成，省掉模型重复输出一遍（2026-09-11）
+    import markdown as _markdown_lib
+except Exception:  # noqa: BLE001 — 缺库时回退 <pre>，不影响起草
+    _markdown_lib = None
 
 
 settings = get_settings()
@@ -95,6 +101,36 @@ async def call_mcp_tool(server_name: str, tool_name: str, params_json: str = "{}
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
+_MCP_REGISTERED = False
+
+
+def ensure_mcp_servers_registered() -> int:
+    """确保进程内 MCP server 已注册，返回已注册 server 数。
+
+    2026-09-11 修复：`register_default_servers()` 此前只在 app/routes/mcp.py 模块
+    导入时执行，而 A2A 子代理服务（:8001/:8002）的导入链不经过 app.main →
+    app.routes.mcp，导致子代理进程内 MCP registry 为空：
+      - list_mcp_servers / list_mcp_tools 返回 []（模型白跑 2 轮）
+      - call_mcp_tool 必然失败
+      - 模板匹配 / 相似检索等 MCP 能力在 A2A 路径失效，与进程内回退路径行为不一致
+    现改为在 build_tools() 处按需注册（幂等），根代理与子代理、A2A 与回退四条
+    路径都走同一处，保证行为一致。注册失败只告警，不阻断代理装配。
+    """
+    global _MCP_REGISTERED
+    if _MCP_REGISTERED:
+        return len(get_mcp_client().list_servers())
+    try:
+        from app.mcps import register_default_servers
+
+        count = register_default_servers()
+        _MCP_REGISTERED = True
+        logger.info("[agent-core] MCP server 已注册：%s 个", count)
+        return count
+    except Exception as exc:  # noqa: BLE001 — 注册失败不阻断装配
+        logger.warning("[agent-core] MCP server 注册失败（工具仍挂载，调用会返回空）: %s", exc)
+        return 0
+
+
 # --- 代理绝缘 httpx 客户端（根因修复 2026-09-10） ---------------------------
 # 事故背景：工具/沙箱进程会注入 HTTP_PROXY=127.0.0.1:8279（sandbox-cli.exe）。
 # langchain_openai / openai SDK 默认 trust_env=True，会把发往 DashScope 的模型请求
@@ -103,23 +139,56 @@ async def call_mcp_tool(server_name: str, tool_name: str, params_json: str = "{}
 # 于是"合同生成慢"的真正源头一直没被堵住。
 # 这里把模型客户端也强制 trust_env=False，从代码层根治——无论后端被谁拉起
 # （start_all.bat / IDE / 工具进程），都不再受环境代理污染。
-_MODEL_HTTP_TIMEOUT = httpx.Timeout(600.0, connect=20.0)
-_PROXY_IMMUNE_SYNC: "httpx.Client | None" = None
-_PROXY_IMMUNE_ASYNC: "httpx.AsyncClient | None" = None
+# 超时按「模型各自的 timeout」分桶缓存（根因修复 2026-09-11）：
+# 此前这里是单一 600s 单例。openai SDK 在传入自定义 http_client 时会以该客户端自身的
+# timeout 为准，于是 build_chat_model(timeout=180) 传下来的收紧值被 600s 盖掉——
+# 实测单次起草挂到 1249.8s 才失败（600 × max_retries=1）。现在每个 timeout 各用各的客户端。
+#
+# 2026-09-12：实现已抽到 app/core/net.py，成为全项目唯一实现（MCP server / AI 服务
+# 也共用），此处保留同名薄封装以不改动既有调用点。新增客户端请直接用 app.core.net。
+_MODEL_CONNECT_TIMEOUT = MODEL_CONNECT_TIMEOUT
 
 
-def _proxy_immune_clients() -> "tuple[httpx.Client, httpx.AsyncClient]":
-    """返回进程级复用的 (同步, 异步) httpx 客户端对，均 trust_env=False。"""
-    global _PROXY_IMMUNE_SYNC, _PROXY_IMMUNE_ASYNC
-    if _PROXY_IMMUNE_SYNC is None:
-        _PROXY_IMMUNE_SYNC = httpx.Client(
-            trust_env=False, timeout=_MODEL_HTTP_TIMEOUT
-        )
-    if _PROXY_IMMUNE_ASYNC is None:
-        _PROXY_IMMUNE_ASYNC = httpx.AsyncClient(
-            trust_env=False, timeout=_MODEL_HTTP_TIMEOUT
-        )
-    return _PROXY_IMMUNE_SYNC, _PROXY_IMMUNE_ASYNC
+def _proxy_immune_clients(
+    timeout: float = 600.0,
+) -> "tuple[httpx.Client, httpx.AsyncClient]":
+    """返回进程级复用的 (同步, 异步) httpx 客户端对，均 trust_env=False，按 timeout 分桶。"""
+    return proxy_immune_clients(timeout)
+
+
+def _rejects_temperature(model: str) -> bool:
+    """命中 NO_TEMPERATURE_MODELS 前缀的模型不传 temperature。
+
+    kimi-k3 等模型不接受该参数，硬传会 400 InvalidParameter 导致起草直接失败。
+    """
+    prefixes = [
+        item.strip().lower()
+        for item in (settings.NO_TEMPERATURE_MODELS or "").split(",")
+        if item.strip()
+    ]
+    name = (model or "").lower()
+    return any(name.startswith(prefix) for prefix in prefixes)
+
+
+def _thinking_budget_for(model: str) -> "dict | None":
+    """命中 THINKING_BUDGET_MODELS 前缀的模型注入 thinking_budget。
+
+    2026-09-11 根因：qwen3.8-2.4t-a95b 是思考型模型且 enable_thinking 被强制 True
+    （传 False 报 400 restricted to True）。起草时思考可吃满 max_tokens，
+    finish_reason=length、正文 0 字，代码回溯抓到 prompt 当正文。
+    用 thinking_budget 限住思考（实测 10240→~110 tokens），正文才拿得到额度。
+    """
+    if settings.THINKING_BUDGET <= 0:
+        return None
+    prefixes = [
+        item.strip().lower()
+        for item in (settings.THINKING_BUDGET_MODELS or "").split(",")
+        if item.strip()
+    ]
+    name = (model or "").lower()
+    if not any(name.startswith(prefix) for prefix in prefixes):
+        return None
+    return {"thinking_budget": settings.THINKING_BUDGET}
 
 
 def build_chat_model(model: "str | None" = None, timeout: float | None = None):
@@ -132,20 +201,31 @@ def build_chat_model(model: "str | None" = None, timeout: float | None = None):
     - http_client/http_async_client 强制 trust_env=False：不读 HTTP_PROXY，
     避免请求被绕进沙箱本地代理而挂死（根因修复 2026-09-10）。
     """
-    sync_client, async_client = _proxy_immune_clients()
+    resolved_model = model or settings.draft_review_llm_model
+    resolved_timeout = timeout or settings.REVIEW_MODEL_TIMEOUT_SECONDS
+    sync_client, async_client = _proxy_immune_clients(resolved_timeout)
+    optional: dict = {}
+    # kimi-k3 等模型不接受 temperature，硬传会 400（见 _rejects_temperature）。
+    if not _rejects_temperature(resolved_model):
+        optional["temperature"] = 0.2
+    # 思考型模型限住思考预算，否则正文拿不到 token 额度（见 _thinking_budget_for）。
+    _budget_body = _thinking_budget_for(resolved_model)
+    if _budget_body:
+        optional["extra_body"] = _budget_body
     return ChatOpenAI(
-        model=model or settings.draft_review_llm_model,
+        model=resolved_model,
         api_key=settings.primary_llm_api_key,
         base_url=(
             settings.primary_llm_api_url.rstrip("/")
             .removesuffix("/chat/completions")
             or "https://dashscope.aliyuncs.com/compatible-mode/v1"
         ),
-        temperature=0.2,
-        timeout=timeout or settings.REVIEW_MODEL_TIMEOUT_SECONDS,
+        timeout=resolved_timeout,
+        max_tokens=settings.MODEL_MAX_TOKENS,  # 防流式输出失控（read timeout 对流式不触发）
         max_retries=1,
         http_client=sync_client,
         http_async_client=async_client,
+        **optional,
     )
 
 
@@ -166,7 +246,7 @@ DRAFTING_SPEC: Dict[str, Any] = {
     "system_prompt": (
         "你负责合同起草子任务，重点输出合同正文、模板选择、相似检索、风险概览和质量检查。"
         "最终回复必须只输出一个 JSON 对象，不要输出任何思考过程、解释文字或 markdown 围栏。"
-        "JSON 结构：{\"content\":{\"title\":\"标题\",\"content\":\"完整正文\",\"html_content\":\"HTML正文\"},"
+        "JSON 结构：{\"content\":{\"title\":\"标题\",\"content\":\"完整正文（Markdown 格式）\"},"
         "\"contract_summary\":{\"summary\":\"摘要\",\"key_points\":[]},"
         "\"quality_check\":{\"status\":\"pass|warning\",\"issues\":[],\"suggestions\":[]}}。"
     ),
@@ -222,8 +302,7 @@ REVIEW_SPEC: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 OUTPUT_CONTRACTS: Dict[str, str] = {
     "drafting": (
-        '{"content":{"title":"文书标题","content":"完整正文，含条款编号，不得省略、不得写待补充",'
-        '"html_content":"正文的 HTML"},'
+        '{"content":{"title":"文书标题","content":"完整正文，含条款编号，不得省略、不得写待补充"},'
         '"contract_summary":{"summary":"摘要","key_points":["要点"]},'
         '"quality_check":{"status":"pass|warning","total_issues":0,"issues":[],"suggestions":[]},'
         '"risk_assessment":{"overall":{"score":0-100,"level":"低|中|高"},'
@@ -246,6 +325,7 @@ class AgentCore:
 
     # ---- deepagents 构建材料 ----
     def build_tools(self) -> list[Any]:
+        ensure_mcp_servers_registered()
         return [list_skill_documents, list_mcp_servers, list_mcp_tools, call_mcp_tool]
 
     def build_skill_documents(self) -> list[str]:
@@ -431,8 +511,14 @@ class AgentCore:
             if isinstance(message, dict):
                 role = str(message.get("role", "") or "").lower()
                 msg_type = msg_type or role
-            # 工具消息一律跳过（LangChain 对象看 type，dict 看 role）
-            if msg_type in ("tool", "function", "tool_call", "observation"):
+            # 工具消息与「非 AI 消息」一律跳过（LangChain 对象看 type，dict 看 role）。
+            # 注意：LangChain HumanMessage 的 type 是 "human" 而非 "user"，
+            # 此前漏跳会导致把「用户 prompt」当成最终正文——实测整段任务指令
+            # （含"任务类型：drafting…【输出要求】…"）被写进了合同（2026-09-11）。
+            if msg_type in (
+                "tool", "function", "tool_call", "observation",
+                "human", "user", "system", "chat",
+            ):
                 continue
             content = getattr(message, "content", None)
             if content is None and isinstance(message, dict):
@@ -738,6 +824,10 @@ class AgentCore:
             ):
                 _degenerate = True
         if len(stripped_body) < 80:
+            _degenerate = True
+        # 防「把 prompt 当正文」：系统指令特征出现在正文里即为退化
+        # （2026-09-11 实测：代理未产出 content 时，回溯取到了 HumanMessage 的 prompt）
+        if "任务类型：" in stripped_body and "输出要求" in stripped_body:
             _degenerate = True
         if _degenerate:
             logger.warning(
@@ -1164,9 +1254,28 @@ class AgentCore:
         ]
 
     def _to_html(self, text: str) -> str:
+        """把起草正文（Markdown / 纯文本）渲染成 HTML。
+
+        2026-09-11 改造：原先只做 `<pre>` 包裹，编辑器会退化成等宽字体的一大块。
+        现在改为真正的 Markdown 渲染（标题/段落/列表/加粗/表格），把「生成 HTML」
+        从模型职责改为代码职责——单次起草可省掉约一半输出 token
+        （实测一份合同正文 ≈7000 tokens ≈175 秒）。
+        """
         if not text:
             return ""
-        return f"<pre>{html.escape(text)}</pre>"
+        raw = text.strip()
+        if not raw:
+            return ""
+        if _markdown_lib is not None:
+            try:
+                rendered = _markdown_lib.markdown(
+                    raw, extensions=["tables", "nl2br", "sane_lists"]
+                )
+                if rendered and rendered.strip():
+                    return rendered
+            except Exception as exc:  # noqa: BLE001 — 渲染失败不能让起草失败
+                logger.warning("[agent_core] Markdown 渲染失败，回退 <pre>: %s", exc)
+        return f"<pre>{html.escape(raw)}</pre>"
 
     def _unwrap_drafting_text(self, text: str) -> tuple[str, str, str | None]:
         """解包起草正文文本。
