@@ -1,10 +1,10 @@
 @echo off
 REM ============================================================
-REM 一键启动：后端 :8000 + 前端 :5173
+REM 一键启动：后端 :8000 + 前端 :5242
 REM YOLO 视频服务 :9001、A2A 子代理（起草 :8001 / 审核 :8002）
 REM 均由后端启动时自动拉起，无需手动启动。
 REM 关闭本窗口不会杀掉已启动的服务；要停服务请用任务管理器或：
-REM   netstat -ano | findstr ":8000 :8001 :8002 :9001 :5173"
+REM   netstat -ano | findstr ":8000 :8001 :8002 :9001 :5242"
 REM ============================================================
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -40,13 +40,13 @@ pushd "%~dp0backend"
 start "legal-backend-8000" "%PYEXE%" -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 popd
 
-echo [2/2] 启动前端 :5173 ...
-start "legal-frontend-5173" cmd /c "cd frontend && npm run dev"
+echo [2/2] 启动前端 :5242 ...
+start "legal-frontend-5242" cmd /c "cd frontend && npm run dev"
 
 echo.
 echo 全部已派发：
 echo   后端        http://127.0.0.1:8000/docs
-echo   前端        http://localhost:5173
+echo   前端        http://localhost:5242
 echo   YOLO        http://127.0.0.1:9001/health  （约 10~30 秒后可用，模型加载需要时间）
 echo   A2A 起草    http://127.0.0.1:8001/.well-known/agent-card.json
 echo   A2A 审核    http://127.0.0.1:8002/.well-known/agent-card.json

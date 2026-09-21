@@ -38,7 +38,10 @@ export default defineConfig({
   },
 
   // 开发环境代理后端 API，避免浏览器跨域、本机 localhost/127.0.0.1 解析差异导致 Failed to fetch
+  // port 5242：5173 落在 Windows 排除端口段 5142-5241（Hyper-V/WSN NAT 保留）内，listen 报 EACCES
   server: {
+    port: 5242,
+    strictPort: true,
     proxy: {
       '/api': {
         target: 'http://127.0.0.1:8000',
